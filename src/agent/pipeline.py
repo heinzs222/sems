@@ -504,6 +504,12 @@ class VoicePipeline:
                         await asyncio.sleep(sleep_time)
                     else:
                         self._pacer_underruns += 1
+                        if self._pacer_underruns % 10 == 0:
+                            logger.warning(
+                                "Audio pacer underrun", 
+                                underruns=self._pacer_underruns,
+                                elapsed_ms=elapsed*1000
+                            )
                         
                 except asyncio.TimeoutError:
                     continue  # No audio available, keep waiting

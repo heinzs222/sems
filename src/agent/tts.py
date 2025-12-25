@@ -190,6 +190,13 @@ class CartesiaTTS:
                                 
                                 if first_byte_time is None:
                                     first_byte_time = time.time()
+                                    # Log audio format info on first chunk
+                                    logger.info(
+                                        "Cartesia first audio chunk",
+                                        bytes_received=len(audio_data),
+                                        expected_rate=CARTESIA_SAMPLE_RATE,
+                                        samples=len(audio_data)//2  # PCM S16 = 2 bytes per sample
+                                    )
                                 
                                 # Convert PCM 8kHz -> mu-law 8kHz (no resampling!)
                                 ulaw_audio = pcm_8k_to_ulaw(audio_data)
