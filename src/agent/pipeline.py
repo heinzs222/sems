@@ -154,6 +154,7 @@ class VoicePipeline:
         self._pacer_running: bool = False
         self._pacer_underruns: int = 0
         self._jitter_buffer_ms: int = 100  # Buffer 100ms before starting playback
+        self._outbound_ulaw_remainder: bytes = b""
         
         # Silence detection
         self._last_speech_time: float = 0.0
@@ -482,8 +483,8 @@ class VoicePipeline:
         frame_duration = 0.020  # 20ms per frame
         next_send_time = time.time()
         
-        # Pre-buffer 3 frames (60ms) before starting to ensure smooth playback
-        prebuffer_frames = 3
+        # Pre-buffer to reduce bursty producer/consumer underruns
+        prebuffer_frames = max(3, int(self._jitter_buffer_ms / 20))
         buffered = 0
         frames_buffer = []
         
@@ -607,10 +608,15 @@ class VoicePipeline:
         await self._start_pacer()
         
         try:
+            # Reset streaming frame remainder for this utterance.
+            # Important: Do NOT pad to 160 bytes per TTS chunk; only pad once at the end,
+            # otherwise we insert silence between streamed chunks which sounds like "ticking".
+            self._outbound_ulaw_remainder = b""
+
             async for chunk in self._tts.synthesize_streaming(text):
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
                     break
-                
+
                 if chunk.audio_bytes:
                     if first_audio_time is None:
                         first_audio_time = time.time()
@@ -619,10 +625,20 @@ class VoicePipeline:
                                 first_audio_time - tts_start
                             ) * 1000
                     
-                    # Queue audio frames to pacer for smooth playback
-                    messages = self._protocol.create_audio_messages(chunk.audio_bytes)
-                    for msg in messages:
+                    # Queue audio frames to pacer for smooth playback.
+                    # Preserve framing across streaming chunks to avoid injecting padding between chunks.
+                    self._outbound_ulaw_remainder += chunk.audio_bytes
+                    while len(self._outbound_ulaw_remainder) >= TWILIO_FRAME_SIZE:
+                        frame = self._outbound_ulaw_remainder[:TWILIO_FRAME_SIZE]
+                        self._outbound_ulaw_remainder = self._outbound_ulaw_remainder[TWILIO_FRAME_SIZE:]
+                        msg = create_media_message(self._protocol.stream_sid, frame)
                         await self._audio_queue.put(msg)
+
+                if chunk.is_final and self._outbound_ulaw_remainder:
+                    frame = self._outbound_ulaw_remainder.ljust(TWILIO_FRAME_SIZE, b"\xff")
+                    self._outbound_ulaw_remainder = b""
+                    msg = create_media_message(self._protocol.stream_sid, frame)
+                    await self._audio_queue.put(msg)
             
             # Record TTS metrics
             if self._current_turn_metrics:
