@@ -40,12 +40,12 @@ RUN mkdir -p assets/audio assets/audio/source logs \
 # Switch to non-root user
 USER appuser
 
-# Expose port
-EXPOSE 7860
+# Expose port (Railway assigns $PORT dynamically)
+EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import httpx; r = httpx.get('http://localhost:7860/health'); r.raise_for_status()"
+# Health check disabled - Railway handles this
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+#     CMD python -c "import httpx; r = httpx.get('http://localhost:8080/health'); r.raise_for_status()"
 
-# Run the application
-CMD ["python", "-m", "server.app"]
+# Run with granian (2025 performance stack)
+CMD ["granian", "--interface", "asgi", "server.app:app", "--host", "0.0.0.0", "--port", "8080", "--websockets-impl", "websockets"]
