@@ -20,13 +20,13 @@ import structlog
 import websockets
 
 from src.agent.config import get_config
-from src.agent.audio import tts_pcm_to_twilio_ulaw
+from src.agent.audio import pcm_8k_to_ulaw
 
 logger = structlog.get_logger(__name__)
 
-# Cartesia output format - use lowest supported rate (22050Hz)
-# Then resample to 8kHz for Twilio (unavoidable with Cartesia)
-CARTESIA_SAMPLE_RATE = 22050
+# Cartesia output format - 8kHz is supported per their docs (2025-12-25)
+# No resampling needed - direct output at Twilio's native rate!
+CARTESIA_SAMPLE_RATE = 8000
 CARTESIA_WS_URL = "wss://api.cartesia.ai/tts/websocket"
 CARTESIA_API_VERSION = "2024-06-10"  # Use supported API version
 
@@ -191,8 +191,8 @@ class CartesiaTTS:
                                 if first_byte_time is None:
                                     first_byte_time = time.time()
                                 
-                                # Convert PCM 22050Hz -> mu-law 8kHz for Twilio
-                                ulaw_audio = tts_pcm_to_twilio_ulaw(audio_data, source_rate=CARTESIA_SAMPLE_RATE)
+                                # Convert PCM 8kHz -> mu-law 8kHz (no resampling!)
+                                ulaw_audio = pcm_8k_to_ulaw(audio_data)
                                 
                                 if ulaw_audio:
                                     total_audio_bytes += len(ulaw_audio)
@@ -216,7 +216,7 @@ class CartesiaTTS:
                                 audio_data = base64.b64decode(audio_b64)
                                 if first_byte_time is None:
                                     first_byte_time = time.time()
-                                ulaw_audio = tts_pcm_to_twilio_ulaw(audio_data, source_rate=CARTESIA_SAMPLE_RATE)
+                                ulaw_audio = pcm_8k_to_ulaw(audio_data)
                                 if ulaw_audio:
                                     total_audio_bytes += len(ulaw_audio)
                                     yield TTSChunk(audio_bytes=ulaw_audio, is_final=False)
@@ -226,7 +226,7 @@ class CartesiaTTS:
                         if isinstance(message, bytes):
                             if first_byte_time is None:
                                 first_byte_time = time.time()
-                            ulaw_audio = tts_pcm_to_twilio_ulaw(message, source_rate=CARTESIA_SAMPLE_RATE)
+                            ulaw_audio = pcm_8k_to_ulaw(message)
                             if ulaw_audio:
                                 total_audio_bytes += len(ulaw_audio)
                                 yield TTSChunk(audio_bytes=ulaw_audio, is_final=False)
