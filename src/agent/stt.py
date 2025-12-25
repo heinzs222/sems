@@ -129,9 +129,9 @@ class DeepgramSTT:
                     f"&channels=1"
                     f"&punctuate=true"
                     f"&interim_results=true"
-                    f"&utterance_end_ms=1000"
+                    f"&utterance_end_ms=500"
                     f"&vad_events=true"
-                    f"&endpointing=300"
+                    f"&endpointing=150"
                     f"&smart_format=true"
                 )
                 url = DEEPGRAM_V1_URL + params
