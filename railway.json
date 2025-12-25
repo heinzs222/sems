@@ -4,7 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "granian --interface asgi server.app:app --port $PORT --host 0.0.0.0",
+    "startCommand": "python -m server.app",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 300
   }
