@@ -120,19 +120,17 @@ class DeepgramSTT:
                 url = DEEPGRAM_V2_URL + params
                 logger.info("Using Deepgram Flux mode (v2)")
             else:
-                # Standard mode with linear16 16kHz (most compatible)
+                # Standard mode with mu-law 8kHz - simplified params
                 params = (
                     f"?model=nova-2"
                     f"&language=en-US"
-                    f"&encoding=linear16"
-                    f"&sample_rate=16000"
+                    f"&encoding=mulaw"
+                    f"&sample_rate=8000"
                     f"&channels=1"
                     f"&punctuate=true"
                     f"&interim_results=true"
-                    f"&utterance_end_ms=1000"
-                    f"&vad_events=true"
-                    f"&endpointing=300"
                     f"&smart_format=true"
+                    f"&endpointing=500"
                 )
                 url = DEEPGRAM_V1_URL + params
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}

@@ -27,7 +27,7 @@ import structlog
 from twilio.rest import Client as TwilioClient
 
 from src.agent.config import get_config, Config
-from src.agent.audio import twilio_ulaw_to_stt_pcm, chunk_audio, TWILIO_FRAME_SIZE
+from src.agent.audio import twilio_ulaw_passthrough, chunk_audio, TWILIO_FRAME_SIZE
 from src.agent.twilio_protocol import (
     TwilioProtocolHandler,
     TwilioEventType,
@@ -298,8 +298,9 @@ class VoicePipeline:
         if not self._is_running:
             return
         
-        # Convert mu-law 8kHz to linear16 16kHz for Deepgram STT
-        audio = twilio_ulaw_to_stt_pcm(event.payload)
+        # Late-2025 best practice: Send mu-law directly to Deepgram (no conversion!)
+        # Deepgram accepts encoding=mulaw&sample_rate=8000
+        audio = twilio_ulaw_passthrough(event.payload)
         
         if audio:
             await self._stt.send_audio(audio)
