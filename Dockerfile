@@ -48,5 +48,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import httpx; r = httpx.get('http://localhost:7860/health'); r.raise_for_status()"
 
 # Run the application with Granian (Rust-based ASGI server)
-# Using /bin/sh -c to properly expand $PORT variable at runtime
-CMD ["/bin/sh", "-c", "granian --interface asgi server.app:app --host 0.0.0.0 --port $PORT --log-level info"]
+# Shell form (no brackets) allows $PORT variable expansion
+CMD granian --interface asgi server.app:app --host 0.0.0.0 --port $PORT --log-level info
