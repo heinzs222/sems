@@ -1,0 +1,5 @@
+[phases.setup]
+aptPkgs = ["libjemalloc2"]
+
+[variables]
+LD_PRELOAD = "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"

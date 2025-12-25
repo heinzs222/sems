@@ -12,13 +12,9 @@ This eliminates CPU-heavy resampling that causes choppy audio.
 import audioop
 from typing import Generator, List
 import struct
-import time
 
 import numpy as np
 from scipy import signal
-import structlog
-
-logger = structlog.get_logger(__name__)
 
 TWILIO_SAMPLE_RATE = 8000
 STT_SAMPLE_RATE = 8000  # Deepgram accepts mulaw/8000 directly - no resampling needed!
@@ -231,9 +227,6 @@ def tts_pcm_to_twilio_ulaw(
     return audioop.lin2ulaw(pcm_bytes, 2)
 
 
-_pcm_conversion_count = 0
-_pcm_conversion_start = None
-
 def pcm_8k_to_ulaw(pcm_bytes: bytes) -> bytes:
     """
     Fast PCM 8kHz to mu-law conversion (no resampling).
@@ -247,40 +240,9 @@ def pcm_8k_to_ulaw(pcm_bytes: bytes) -> bytes:
     Returns:
         Mu-law bytes at 8kHz
     """
-    global _pcm_conversion_count, _pcm_conversion_start
-    
     if not pcm_bytes:
         return b""
-    
-    # Track first conversion for timing
-    if _pcm_conversion_start is None:
-        _pcm_conversion_start = time.time()
-    
-    _pcm_conversion_count += 1
-    
-    # Log every 50 conversions (once per second at 50 chunks/sec)
-    if _pcm_conversion_count % 50 == 0:
-        elapsed = time.time() - _pcm_conversion_start
-        logger.info(
-            "Audio conversion stats",
-            total_conversions=_pcm_conversion_count,
-            elapsed_sec=round(elapsed, 2),
-            rate_per_sec=round(_pcm_conversion_count / elapsed, 1) if elapsed > 0 else 0
-        )
-    
-    result = audioop.lin2ulaw(pcm_bytes, 2)
-    
-    # Log chunk sizes for first few conversions
-    if _pcm_conversion_count <= 3:
-        logger.info(
-            "PCM to ulaw conversion",
-            pcm_bytes_in=len(pcm_bytes),
-            ulaw_bytes_out=len(result),
-            samples_in=len(pcm_bytes) // 2,
-            duration_ms=round((len(pcm_bytes) // 2) / 8, 1)  # 8 samples per ms at 8kHz
-        )
-    
-    return result
+    return audioop.lin2ulaw(pcm_bytes, 2)
 
 
 def chunk_audio(audio_bytes: bytes, chunk_size: int = TWILIO_FRAME_SIZE) -> Generator[bytes, None, None]:

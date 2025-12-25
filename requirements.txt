@@ -3,14 +3,13 @@
 
 # Core
 fastapi
-websockets<14.0       # granian requires websockets<14.0
+granian==1.6.3      # Replaces uvicorn
+uvloop==0.21.0      # Faster asyncio
+msgspec==0.18.6     # Faster JSON
+uvicorn[standard]
+websockets
 python-dotenv
 httpx
-
-# 2025 Performance Stack (Rust-based for low latency voice)
-granian==1.6.3        # Rust HTTP/WebSocket server (replaces uvicorn)
-uvloop==0.21.0        # Faster asyncio event loop (Linux only)
-msgspec==0.18.6       # Fast JSON parsing (replaces json module)
 
 # Twilio
 twilio

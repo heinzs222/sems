@@ -1,9 +1,8 @@
 # =============================================================================
-# Twilio Voice Agent - Docker Image (2025 Performance Stack)
+# Twilio Voice Agent - Docker Image
 # =============================================================================
 # Build: docker build -t twilio-voice-agent .
-# Run:   docker run -p 8080:8080 --env-file .env twilio-voice-agent
-# Updated: 2025-12-25 - Using granian for low-latency WebSocket
+# Run:   docker run -p 7860:7860 --env-file .env twilio-voice-agent
 # =============================================================================
 
 FROM python:3.12-slim
@@ -41,12 +40,12 @@ RUN mkdir -p assets/audio assets/audio/source logs \
 # Switch to non-root user
 USER appuser
 
-# Expose port (Railway assigns $PORT dynamically)
-EXPOSE 8080
+# Expose port
+EXPOSE 7860
 
-# Health check disabled - Railway handles this
-# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-#     CMD python -c "import httpx; r = httpx.get('http://localhost:8080/health'); r.raise_for_status()"
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import httpx; r = httpx.get('http://localhost:7860/health'); r.raise_for_status()"
 
-# Run with granian (2025 performance stack)
-CMD ["granian", "--interface", "asgi", "server.app:app", "--host", "0.0.0.0", "--port", "8080", "--websockets-impl", "websockets"]
+# Run the application
+CMD ["python", "-m", "server.app"]
