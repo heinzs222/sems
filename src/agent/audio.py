@@ -13,9 +13,6 @@ import audioop
 from typing import Generator, List
 import struct
 
-import numpy as np
-from scipy import signal
-
 TWILIO_SAMPLE_RATE = 8000
 STT_SAMPLE_RATE = 8000  # Deepgram accepts mulaw/8000 directly - no resampling needed!
 TTS_SAMPLE_RATE = 8000  # Request Cartesia to output 8kHz directly
@@ -59,7 +56,7 @@ def linear16_to_ulaw(pcm_bytes: bytes) -> bytes:
 
 def resample_8k_to_16k(pcm_8k: bytes) -> bytes:
     """
-    Resample linear PCM from 8kHz to 16kHz.
+    Resample linear PCM from 8kHz to 16kHz using audioop.
     
     Args:
         pcm_8k: Linear PCM 16-bit bytes at 8kHz
@@ -70,27 +67,15 @@ def resample_8k_to_16k(pcm_8k: bytes) -> bytes:
     if not pcm_8k:
         return b""
     
-    # Convert bytes to numpy array
-    samples_8k = np.frombuffer(pcm_8k, dtype=np.int16)
-    
-    if len(samples_8k) == 0:
-        return b""
-    
-    # Calculate new length
-    new_length = int(len(samples_8k) * STT_SAMPLE_RATE / TWILIO_SAMPLE_RATE)
-    
-    # Resample using scipy
-    samples_16k = signal.resample(samples_8k, new_length)
-    
-    # Convert back to int16
-    samples_16k = np.clip(samples_16k, -32768, 32767).astype(np.int16)
-    
-    return samples_16k.tobytes()
+    # Use audioop.ratecv for resampling (much faster than scipy)
+    # ratecv returns (converted_data, new_state)
+    converted, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
+    return converted
 
 
 def resample_16k_to_8k(pcm_16k: bytes) -> bytes:
     """
-    Resample linear PCM from 16kHz to 8kHz.
+    Resample linear PCM from 16kHz to 8kHz using audioop.
     
     Args:
         pcm_16k: Linear PCM 16-bit bytes at 16kHz
@@ -101,27 +86,14 @@ def resample_16k_to_8k(pcm_16k: bytes) -> bytes:
     if not pcm_16k:
         return b""
     
-    # Convert bytes to numpy array
-    samples_16k = np.frombuffer(pcm_16k, dtype=np.int16)
-    
-    if len(samples_16k) == 0:
-        return b""
-    
-    # Calculate new length
-    new_length = int(len(samples_16k) * TWILIO_SAMPLE_RATE / STT_SAMPLE_RATE)
-    
-    # Resample using scipy
-    samples_8k = signal.resample(samples_16k, new_length)
-    
-    # Convert back to int16
-    samples_8k = np.clip(samples_8k, -32768, 32767).astype(np.int16)
-    
-    return samples_8k.tobytes()
+    # Use audioop.ratecv for resampling
+    converted, _ = audioop.ratecv(pcm_16k, 2, 1, 16000, 8000, None)
+    return converted
 
 
 def resample_to_8k(pcm_bytes: bytes, source_rate: int) -> bytes:
     """
-    Resample linear PCM from any sample rate to 8kHz.
+    Resample linear PCM from any sample rate to 8kHz using audioop.
     
     Args:
         pcm_bytes: Linear PCM 16-bit bytes
@@ -133,22 +105,9 @@ def resample_to_8k(pcm_bytes: bytes, source_rate: int) -> bytes:
     if not pcm_bytes or source_rate == TWILIO_SAMPLE_RATE:
         return pcm_bytes
     
-    samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-    
-    if len(samples) == 0:
-        return b""
-    
-    # Calculate new length
-    new_length = int(len(samples) * TWILIO_SAMPLE_RATE / source_rate)
-    
-    if new_length == 0:
-        return b""
-    
-    # Resample
-    resampled = signal.resample(samples, new_length)
-    resampled = np.clip(resampled, -32768, 32767).astype(np.int16)
-    
-    return resampled.tobytes()
+    # Use audioop.ratecv for fast resampling
+    converted, _ = audioop.ratecv(pcm_bytes, 2, 1, source_rate, TWILIO_SAMPLE_RATE, None)
+    return converted
 
 
 def twilio_ulaw_to_stt_pcm(ulaw_bytes: bytes) -> bytes:

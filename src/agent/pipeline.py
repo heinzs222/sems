@@ -480,36 +480,79 @@ class VoicePipeline:
         """
         self._pacer_running = True
         frame_duration = 0.020  # 20ms per frame
+        next_send_time = time.time()
+        
+        # Pre-buffer 3 frames (60ms) before starting to ensure smooth playback
+        prebuffer_frames = 3
+        buffered = 0
+        frames_buffer = []
         
         try:
-            while self._pacer_running and self._is_running:
+            # Pre-buffer phase
+            while buffered < prebuffer_frames and self._pacer_running:
                 try:
-                    # Wait for audio frame with timeout
                     frame_msg = await asyncio.wait_for(
                         self._audio_queue.get(),
-                        timeout=0.1
+                        timeout=0.5
                     )
+                    if frame_msg is None:
+                        break
+                    frames_buffer.append(frame_msg)
+                    buffered += 1
+                except asyncio.TimeoutError:
+                    break
+            
+            # Main pacing loop
+            while self._pacer_running and self._is_running:
+                try:
+                    # Get frame from buffer or queue
+                    if frames_buffer:
+                        frame_msg = frames_buffer.pop(0)
+                    else:
+                        # Non-blocking get to maintain timing
+                        try:
+                            frame_msg = self._audio_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            # No frame available, send silence to maintain timing
+                            frame_msg = None
                     
-                    if frame_msg is None:  # Poison pill to stop
+                    if frame_msg is None:
+                        # Check for new audio with small timeout
+                        try:
+                            frame_msg = await asyncio.wait_for(
+                                self._audio_queue.get(),
+                                timeout=0.015  # Most of the 20ms window
+                            )
+                        except asyncio.TimeoutError:
+                            # Still no audio, continue loop
+                            await asyncio.sleep(0.005)
+                            continue
+                    
+                    if frame_msg is None:  # Poison pill
                         break
                     
-                    # Send frame and pace at 20ms
-                    send_start = time.time()
+                    # Wait until next send time for precise 20ms intervals
+                    now = time.time()
+                    wait_time = next_send_time - now
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
+                    
+                    # Send frame
                     await self._send_message(frame_msg)
                     
-                    # Sleep for remaining time in 20ms window
-                    elapsed = time.time() - send_start
-                    sleep_time = frame_duration - elapsed
-                    if sleep_time > 0:
-                        await asyncio.sleep(sleep_time)
-                    else:
+                    # Calculate next send time (exactly 20ms later)
+                    next_send_time += frame_duration
+                    
+                    # If we're falling behind, reset timing
+                    if time.time() > next_send_time + 0.040:  # More than 2 frames behind
                         self._pacer_underruns += 1
                         if self._pacer_underruns % 10 == 0:
                             logger.warning(
-                                "Audio pacer underrun", 
+                                "Audio pacer reset timing", 
                                 underruns=self._pacer_underruns,
-                                elapsed_ms=elapsed*1000
+                                behind_ms=(time.time() - next_send_time)*1000
                             )
+                        next_send_time = time.time()
                         
                 except asyncio.TimeoutError:
                     continue  # No audio available, keep waiting
