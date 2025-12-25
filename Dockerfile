@@ -1,8 +1,9 @@
 # =============================================================================
-# Twilio Voice Agent - Docker Image
+# Twilio Voice Agent - Docker Image (2025 Performance Stack)
 # =============================================================================
 # Build: docker build -t twilio-voice-agent .
-# Run:   docker run -p 7860:7860 --env-file .env twilio-voice-agent
+# Run:   docker run -p 8080:8080 --env-file .env twilio-voice-agent
+# Updated: 2025-12-25 - Using granian for low-latency WebSocket
 # =============================================================================
 
 FROM python:3.12-slim
