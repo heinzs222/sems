@@ -10,6 +10,14 @@ Endpoints:
 
 import asyncio
 import sys
+
+# 2025 Performance: Use uvloop for faster asyncio (Linux only)
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass  # uvloop not available on Windows
+
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field

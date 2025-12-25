@@ -21,12 +21,28 @@ Outbound messages:
 """
 
 import base64
-import json
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from enum import Enum
 
 import structlog
+
+# 2025 Performance: Use msgspec for faster JSON (50+ messages/sec for audio)
+try:
+    import msgspec
+    _decoder = msgspec.json.Decoder()
+    _encoder = msgspec.json.Encoder()
+    
+    def json_loads(data):
+        return _decoder.decode(data)
+    
+    def json_dumps(obj):
+        return _encoder.encode(obj).decode('utf-8')
+    
+except ImportError:
+    import json
+    json_loads = json.loads
+    json_dumps = json.dumps
 
 from src.agent.audio import chunk_audio, TWILIO_FRAME_SIZE
 
@@ -164,8 +180,8 @@ def parse_twilio_message(raw_message: str) -> tuple[TwilioEventType, Any]:
         ValueError: If message cannot be parsed
     """
     try:
-        message = json.loads(raw_message)
-    except json.JSONDecodeError as e:
+        message = json_loads(raw_message)
+    except Exception as e:
         logger.error("Failed to parse Twilio message", error=str(e))
         raise ValueError(f"Invalid JSON: {e}")
     
@@ -217,7 +233,7 @@ def create_media_message(
         }
     }
     
-    return json.dumps(message)
+    return json_dumps(message)
 
 
 def create_mark_message(stream_sid: str, name: str) -> str:
@@ -241,7 +257,7 @@ def create_mark_message(stream_sid: str, name: str) -> str:
         }
     }
     
-    return json.dumps(message)
+    return json_dumps(message)
 
 
 def create_clear_message(stream_sid: str) -> str:
@@ -261,7 +277,7 @@ def create_clear_message(stream_sid: str) -> str:
         "streamSid": stream_sid
     }
     
-    return json.dumps(message)
+    return json_dumps(message)
 
 
 class TwilioProtocolHandler:
