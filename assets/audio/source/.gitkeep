@@ -1,0 +1,7 @@
+# Place your WAV source files here:
+# - pricing.wav
+# - who_are_you.wav
+# - stop.wav
+#
+# Then run: make audio
+# to convert them to .mulaw format

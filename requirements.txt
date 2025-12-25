@@ -1,0 +1,44 @@
+# Twilio Voice Agent - Dependencies
+# Python 3.10+ required
+
+# Core
+fastapi
+uvicorn[standard]
+websockets
+python-dotenv
+httpx
+
+# Twilio
+twilio
+
+# Deepgram STT
+deepgram-sdk
+
+# Cartesia TTS
+cartesia
+
+# Groq LLM
+openai
+groq
+
+# Structured extraction
+instructor
+pydantic
+
+# Semantic routing (enables fast cached responses)
+semantic-router[fastembed]
+fastembed
+
+# Audio
+numpy
+scipy
+
+# Async
+aiofiles
+
+# Logging
+structlog
+
+# Testing
+pytest
+pytest-asyncio

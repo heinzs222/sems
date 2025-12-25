@@ -1,0 +1,486 @@
+================================================================================
+                    TWILIO VOICE AGENT - HOW IT WORKS
+================================================================================
+
+This document explains how the Twilio Voice Agent works, from receiving a call
+to generating speech responses.
+
+================================================================================
+INSTALLED PACKAGE VERSIONS
+================================================================================
+
+Core Framework:
+- Python 3.10+ required
+- fastapi==0.126.0
+- uvicorn==0.40.0
+- websockets==15.0.1 (note: use websockets<14.0 for Deepgram compatibility)
+- aiofiles==25.1.0
+
+APIs & SDKs:
+- twilio==9.9.0
+- deepgram-sdk==5.3.0
+- cartesia==2.0.17
+- openai==2.14.0
+- groq==1.0.0
+
+AI/ML:
+- instructor==1.13.0
+- pydantic==2.12.5
+
+Audio Processing:
+- numpy==2.2.6
+- scipy==1.16.3
+
+Logging:
+- structlog==25.5.0
+
+Note: This project uses raw WebSocket connections for Deepgram and Cartesia
+instead of their SDK clients due to API compatibility issues.
+
+================================================================================
+OVERVIEW
+================================================================================
+
+This is an AI-powered voice agent that:
+1. Receives phone calls via Twilio
+2. Transcribes caller speech in real-time (Deepgram STT)
+3. Generates intelligent responses (Groq LLM)
+4. Speaks responses back to the caller (Cartesia TTS)
+
+================================================================================
+WHY CHOPPY AUDIO HAPPENS (AND HOW WE FIX IT)
+================================================================================
+
+Late-2025 best practices implemented in this codebase:
+
+ROOT CAUSE #1: Unnecessary Audio Resampling
+-------------------------------------------
+OLD (causes choppy audio):
+  Twilio mu-law 8kHz -> PCM 16kHz -> Deepgram (STT)
+  Cartesia PCM 22kHz -> resample to 8kHz -> mu-law -> Twilio
+
+NEW (smooth audio):
+  Twilio mu-law 8kHz -> DIRECT to Deepgram (encoding=mulaw, sample_rate=8000)
+  Cartesia PCM 8kHz -> mu-law 8kHz -> Twilio (only one fast conversion!)
+
+FIX: Request 8kHz directly from Cartesia, send mu-law directly to Deepgram.
+     Eliminates CPU-heavy scipy.signal.resample() calls.
+
+ROOT CAUSE #2: Bursty Audio Sends (No Pacing)
+---------------------------------------------
+OLD: Send all TTS audio chunks as fast as possible
+     -> Network bursts -> Twilio buffer underflows -> choppy playback
+
+NEW: Audio pacer task sends exactly one 160-byte frame every 20ms
+     -> Smooth, consistent frame delivery -> clean playback
+
+FIX: Outbound audio queue with dedicated pacer task (see pipeline.py)
+
+ROOT CAUSE #3: Network Jitter (Tunisia <-> North America via ngrok)
+-------------------------------------------------------------------
+Problem: High-latency, jittery path causes variable delivery times
+         Even perfect code can sound choppy if frames arrive late
+
+FIX: For production, deploy server in North America (near Twilio edges)
+     Keep Tunisia machine for development only.
+
+ROOT CAUSE #4: Dirty Interruptions
+----------------------------------
+OLD: Cancel TTS, hope Twilio stops playing
+     -> Audio artifacts, "talking over yourself"
+
+NEW: 
+  1. Send Cartesia cancel context request
+  2. Send Twilio "clear" message to flush buffer
+  3. Wait for Twilio "mark" to confirm playback stopped
+
+FIX: Proper cancel_context() + clear message sequence (see tts.py, pipeline.py)
+
+================================================================================
+PRODUCTION DEPLOYMENT GUIDANCE
+================================================================================
+
+For best audio quality on Twilio phone calls:
+
+1. DEPLOY NEAR TWILIO EDGES
+   - If callers are in North America, deploy server in US-East or Canada
+   - Twilio Media Streams default to US1 region
+   - Minimizes latency and jitter
+
+2. DON'T USE NGROK IN PRODUCTION
+   - ngrok adds latency and unpredictable jitter
+   - Use a proper cloud deployment (Railway, Render, AWS, GCP, etc.)
+   - Direct server-to-Twilio connection is essential for quality
+
+3. USE PROPER SSL/TLS
+   - Twilio requires wss:// for WebSocket connections
+   - Use a proper certificate (Let's Encrypt, etc.)
+
+4. MONITOR KEY METRICS
+   - Mark round-trip time (should be <200ms)
+   - Pacer underruns (should be 0)
+   - Outbound queue depth (should stay small)
+
+5. ZOIPER/SIP SETTINGS
+   - Use G.711 mu-law (PCMU) codec if possible
+   - Reduces transcoding before audio reaches Twilio
+
+RECOMMENDED HOSTING:
+- Railway (easy deployment, good North American presence)
+- Render (similar to Railway)
+- AWS ECS/Fargate in us-east-1
+- GCP Cloud Run in us-east1
+- Fly.io (can specify region)
+
+================================================================================
+ARCHITECTURE FLOW
+================================================================================
+
+    Phone Call
+        |
+        v
+    Twilio (SIP/Phone Number)
+        |
+        v
+    /incoming-call endpoint (returns TwiML)
+        |
+        v
+    Twilio connects WebSocket to /ws
+        |
+        v
+    Voice Pipeline starts
+        |
+        +---> Deepgram STT (Speech-to-Text)
+        |           |
+        |           v
+        |     Transcribed text
+        |           |
+        +---> Groq LLM (Generate response)
+        |           |
+        |           v
+        |     Response text
+        |           |
+        +---> Cartesia TTS (Text-to-Speech)
+        |           |
+        |           v
+        |     Audio chunks (mu-law 8kHz)
+        |           |
+        v
+    Send audio back to Twilio --> Caller hears response
+
+================================================================================
+KEY COMPONENTS
+================================================================================
+
+1. SERVER (server/app.py)
+   -----------------------
+   - FastAPI web server running on port 7860
+   - Endpoints:
+     * GET/POST /incoming-call - Returns TwiML to connect call to WebSocket
+     * WebSocket /ws - Handles real-time audio streaming with Twilio
+     * GET /health - Health check endpoint
+     * GET /metrics - Call metrics
+
+2. TWILIO PROTOCOL (src/agent/twilio_protocol.py)
+   -----------------------------------------------
+   - Parses Twilio WebSocket messages (JSON format)
+   - Message types:
+     * "connected" - WebSocket connected
+     * "start" - Call started, contains callSid and streamSid
+     * "media" - Audio data (base64-encoded mu-law 8kHz)
+     * "mark" - Marker acknowledgment
+     * "stop" - Call ended
+   - Creates outbound messages:
+     * Media messages - Send audio to caller
+     * Clear messages - Stop current audio playback (for interruptions)
+
+3. AUDIO CONVERSION (src/agent/audio.py)
+   --------------------------------------
+   Twilio uses: mu-law 8kHz (telephone quality)
+   Deepgram needs: Linear PCM 16kHz
+   Cartesia outputs: Linear PCM 22050Hz
+   
+   Conversions:
+   - Twilio -> Deepgram: mu-law 8kHz -> PCM 16kHz
+   - Cartesia -> Twilio: PCM 22050Hz -> mu-law 8kHz
+
+4. SPEECH-TO-TEXT (src/agent/stt.py)
+   ----------------------------------
+   - Uses Deepgram WebSocket API
+   - Streams audio in real-time
+   - Returns partial and final transcripts
+   - Detects end of speech (utterance end)
+
+5. LLM (src/agent/llm.py)
+   -----------------------
+   - Uses Groq API (OpenAI-compatible)
+   - Model: llama-3.1-8b-instant (configurable)
+   - Maintains conversation history
+   - System prompt defines agent persona
+
+6. TEXT-TO-SPEECH (src/agent/tts.py)
+   ----------------------------------
+   - Uses Cartesia WebSocket API
+   - Streams audio chunks for low latency
+   - Converts to mu-law 8kHz for Twilio
+
+7. VOICE PIPELINE (src/agent/pipeline.py)
+   ---------------------------------------
+   - Orchestrates the full conversation flow
+   - Handles:
+     * Audio routing between components
+     * Barge-in detection (interrupting the agent)
+     * Turn management
+     * Metrics tracking
+
+================================================================================
+SETUP STEPS
+================================================================================
+
+1. INSTALL DEPENDENCIES
+   pip install -r requirements.txt
+
+2. CONFIGURE ENVIRONMENT (.env file)
+   Required variables:
+   - PUBLIC_HOST=your-ngrok-url.ngrok-free.app
+   - TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   - TWILIO_AUTH_TOKEN=your_auth_token
+   - DEEPGRAM_API_KEY=your_deepgram_key
+   - CARTESIA_API_KEY=your_cartesia_key
+   - CARTESIA_VOICE_ID=your_voice_id (e.g., a]a0e99977-9cb2-4ff8-a719-0c]963963d2eb)
+   - GROQ_API_KEY=your_groq_key
+
+3. START THE SERVER
+   python -m server.app
+
+4. START NGROK (in separate terminal)
+   ngrok http 7860
+
+5. UPDATE PUBLIC_HOST
+   Copy your ngrok URL to .env file (without https://)
+
+6. CONFIGURE TWILIO
+   
+   For SIP Domain:
+   - Go to Twilio Console -> Voice -> SIP Domains
+   - Select your SIP domain
+   - Set "A call comes in" webhook to:
+     https://your-ngrok-url.ngrok-free.app/incoming-call
+   - Method: POST or GET
+
+   For Phone Number:
+   - Go to Twilio Console -> Phone Numbers -> Active Numbers
+   - Select your number
+   - Set "A call comes in" to TwiML Bin or webhook
+   - TwiML content:
+     <?xml version="1.0" encoding="UTF-8"?>
+     <Response>
+         <Connect>
+             <Stream url="wss://your-ngrok-url.ngrok-free.app/ws" />
+         </Connect>
+     </Response>
+
+7. TEST
+   Call your Twilio number or SIP endpoint!
+
+================================================================================
+AUDIO FORMAT DETAILS
+================================================================================
+
+Twilio Media Streams:
+- Format: mu-law (G.711)
+- Sample rate: 8000 Hz
+- Bit depth: 8-bit
+- Chunk size: 160 bytes (20ms of audio)
+- Encoding: Base64 in JSON messages
+
+Deepgram STT Input:
+- Format: Linear PCM
+- Sample rate: 16000 Hz
+- Bit depth: 16-bit signed little-endian
+
+Cartesia TTS Output:
+- Format: Linear PCM
+- Sample rate: 22050 Hz
+- Bit depth: 16-bit signed little-endian
+
+================================================================================
+CONVERSATION FLOW
+================================================================================
+
+1. Caller dials Twilio number/SIP
+2. Twilio calls /incoming-call webhook
+3. Server returns TwiML with <Stream> to /ws
+4. Twilio establishes WebSocket connection
+5. Server starts voice pipeline:
+   - Connects to Deepgram STT
+   - Plays greeting (if configured)
+6. Caller speaks
+7. Audio flows: Twilio -> Server -> Deepgram
+8. Deepgram returns transcript
+9. On final transcript, server sends to Groq LLM
+10. LLM response streamed to Cartesia TTS
+11. TTS audio streamed back to Twilio -> Caller hears response
+12. Loop continues until call ends
+
+================================================================================
+BARGE-IN (INTERRUPTION)
+================================================================================
+
+When the agent is speaking and the caller starts talking:
+1. Deepgram detects speech
+2. If word count >= MIN_INTERRUPTION_WORDS (default: 3)
+3. Server cancels TTS synthesis
+4. Server sends "clear" event to Twilio (stops audio playback)
+5. New transcript processed as next turn
+
+================================================================================
+TIMING & DELAY SETTINGS
+================================================================================
+
+These timing values are hardcoded in the source files and affect latency:
+
+AUDIO FRAMING (src/agent/audio.py):
+-----------------------------------
+- FRAME_DURATION_MS = 20           # Each audio frame is 20 milliseconds
+- TWILIO_FRAME_SIZE = 160 bytes    # 160 bytes = 20ms at 8kHz mu-law
+- Audio is chunked into 20ms frames for smooth Twilio playback
+
+DEEPGRAM STT (src/agent/stt.py):
+--------------------------------
+- utterance_end_ms = 1000          # 1000ms (1 second) of silence = end of utterance
+- endpointing = 300                # 300ms of silence triggers endpoint detection
+- interim_results = true           # Get partial transcripts while speaking
+- vad_events = true                # Voice Activity Detection enabled
+
+  These affect response latency:
+  - Lower endpointing (e.g., 200) = faster response but may cut off speaker
+  - Higher endpointing (e.g., 500) = waits longer, better for slow speakers
+  - utterance_end_ms determines when a "final" transcript is sent
+
+SAMPLE RATES:
+-------------
+- TWILIO_SAMPLE_RATE = 8000 Hz     # Twilio audio (telephone quality)
+- STT_SAMPLE_RATE = 16000 Hz       # Deepgram input requirement
+- CARTESIA_SAMPLE_RATE = 22050 Hz  # Cartesia TTS output
+
+INTERRUPTION DETECTION:
+-----------------------
+- MIN_INTERRUPTION_WORDS = 3       # Configurable in .env
+  (Caller must speak 3+ words to interrupt the agent)
+
+To modify timing, edit the values in:
+- src/agent/stt.py (lines ~96-107) for Deepgram settings
+- src/agent/audio.py (lines ~21-24) for frame sizes
+- .env for MIN_INTERRUPTION_WORDS
+
+================================================================================
+CONFIGURATION OPTIONS (.env)
+================================================================================
+
+Server:
+- PORT=7860                    # Server port
+- PUBLIC_HOST=                 # Your ngrok/public URL
+- LOG_LEVEL=INFO               # DEBUG, INFO, WARNING, ERROR
+
+API Keys:
+- TWILIO_ACCOUNT_SID=          # Twilio account SID
+- TWILIO_AUTH_TOKEN=           # Twilio auth token
+- DEEPGRAM_API_KEY=            # Deepgram API key
+- CARTESIA_API_KEY=            # Cartesia API key
+- CARTESIA_VOICE_ID=           # Cartesia voice ID
+- GROQ_API_KEY=                # Groq API key
+- GROQ_MODEL=llama-3.1-8b-instant  # Groq model name
+
+Agent Behavior:
+- AGENT_NAME=Sesame            # Agent's name
+- COMPANY_NAME=Sesame AI       # Company name
+- MIN_INTERRUPTION_WORDS=3     # Words needed to interrupt
+
+Features:
+- ROUTER_ENABLED=true          # Enable semantic routing
+- OUTLINES_ENABLED=false       # Enable Outlines extraction
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+1. "Cannot hear the agent"
+   - Check Cartesia API key and voice ID
+   - Look for TTS errors in server logs
+   - Verify audio conversion is working
+
+2. "Agent doesn't respond"
+   - Check Deepgram API key
+   - Look for STT connection errors
+   - Verify audio is being received (check media events)
+
+3. "Call disconnects immediately"
+   - Check ngrok is running and URL matches PUBLIC_HOST
+   - Verify TwiML is correct
+   - Check server logs for errors
+
+4. "11200 Error in Twilio"
+   - Your webhook URL is not reachable
+   - Make sure ngrok is running
+   - Verify the endpoint returns 200 OK
+
+5. "WebSocket connection fails"
+   - Check PUBLIC_HOST in .env matches ngrok URL
+   - Ensure wss:// (not ws://) for ngrok
+
+================================================================================
+FILE STRUCTURE
+================================================================================
+
+sesame_twilio_bot_windsurf/
+├── .env                    # Your configuration (gitignored)
+├── .env.example            # Example configuration
+├── requirements.txt        # Python dependencies
+├── server/
+│   └── app.py              # FastAPI server
+├── src/
+│   └── agent/
+│       ├── config.py       # Configuration management
+│       ├── audio.py        # Audio conversion utilities
+│       ├── twilio_protocol.py  # Twilio WebSocket protocol
+│       ├── stt.py          # Deepgram STT client
+│       ├── tts.py          # Cartesia TTS client
+│       ├── llm.py          # Groq LLM client
+│       ├── pipeline.py     # Voice pipeline orchestrator
+│       ├── routing.py      # Semantic routing (optional)
+│       └── extract.py      # Structured extraction
+├── tests/                  # Test files
+├── scripts/                # Utility scripts
+└── assets/audio/           # Cached audio files
+
+================================================================================
+QUICK START COMMANDS
+================================================================================
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Start server
+python -m server.app
+
+# Start ngrok (in another terminal)
+ngrok http 7860
+
+# Run tests
+pytest tests/
+
+================================================================================
+SUPPORT
+================================================================================
+
+For issues:
+1. Check server logs for error messages
+2. Verify all API keys are correct
+3. Test each component individually:
+   - /health endpoint should return {"status": "healthy"}
+   - Check Deepgram dashboard for STT activity
+   - Check Groq usage for LLM calls
+   - Check Cartesia dashboard for TTS activity
+
+================================================================================
