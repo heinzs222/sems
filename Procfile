@@ -1,1 +1,1 @@
-web: granian --interface asgi --host 0.0.0.0 --port 8080 --workers 1 --ws server.app:app
+web: granian --interface asgi server.app:app --host 0.0.0.0 --port $PORT --websockets-impl websockets
