@@ -122,7 +122,7 @@ class DeepgramSTT:
             else:
                 # Standard mode with mu-law 8kHz - simplified params
                 params = (
-                    f"?model=nova-2"
+                    f"?model=nova-3"
                     f"&language=en-US"
                     f"&encoding=mulaw"
                     f"&sample_rate=8000"
