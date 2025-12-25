@@ -9,8 +9,12 @@ Endpoints:
 """
 
 import asyncio
-import uvloop
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    # uvloop is not available on Windows
+    pass
 import sys
 import time
 from contextlib import asynccontextmanager
