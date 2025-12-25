@@ -120,18 +120,18 @@ class DeepgramSTT:
                 url = DEEPGRAM_V2_URL + params
                 logger.info("Using Deepgram Flux mode (v2)")
             else:
-                # Standard mode with mu-law 8kHz
+                # Standard mode with linear16 16kHz (most compatible)
                 params = (
                     f"?model=nova-2"
                     f"&language=en-US"
-                    f"&encoding=mulaw"  # Direct mu-law - no conversion!
-                    f"&sample_rate=8000"  # Twilio's native rate
+                    f"&encoding=linear16"
+                    f"&sample_rate=16000"
                     f"&channels=1"
                     f"&punctuate=true"
                     f"&interim_results=true"
-                    f"&utterance_end_ms=800"
+                    f"&utterance_end_ms=1000"
                     f"&vad_events=true"
-                    f"&endpointing=250"
+                    f"&endpointing=300"
                     f"&smart_format=true"
                 )
                 url = DEEPGRAM_V1_URL + params
