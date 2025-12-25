@@ -27,7 +27,6 @@ import logging
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import JSONResponse
 import structlog
-import uvicorn
 
 # Configure logging before imports
 from src.agent.config import get_config, init_config, ConfigError
@@ -297,13 +296,10 @@ def main() -> None:
         port=getattr(config, 'port', 7860),
     )
     
-    uvicorn.run(
-        "server.app:app",
-        host="0.0.0.0",
-        port=getattr(config, 'port', 7860),
-        log_level=getattr(config, 'log_level', 'INFO').lower(),
-        reload=False,
-    )
+    # Note: When using granian, the server is started via command line
+    # This main() is only for local development with: python -m server.app
+    print(f"Server configured on port {getattr(config, 'port', 7860)}")
+    print("Use granian to start: granian --interface asgi server.app:app --host 0.0.0.0 --port 8080")
 
 
 if __name__ == "__main__":
