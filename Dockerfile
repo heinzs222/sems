@@ -47,5 +47,5 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import os, httpx; port=os.getenv('PORT','7860'); r=httpx.get(f'http://localhost:{port}/health'); r.raise_for_status()"
 
-# Run the application with Granian (Rust-based ASGI server)
-CMD ["sh", "scripts/start.sh"]
+# Run the application
+CMD ["python", "-m", "server.app"]

@@ -473,30 +473,89 @@ class VoicePipeline:
     
     async def _audio_pacer(self) -> None:
         """
-        Outbound audio pacer - sends frames at steady intervals.
+        Outbound audio pacer - sends frames at exactly 20ms intervals.
         
-        Simplified design: Just send frames as they arrive with proper timing.
-        Twilio handles its own buffering on the receiving end.
+        Late-2025 best practice: Pace outbound audio to prevent buffer underflows
+        that cause choppy playback. Uses a jitter buffer before starting.
         """
         self._pacer_running = True
+        frame_duration = 0.020  # 20ms per frame
+        next_send_time = time.time()
+        
+        # Pre-buffer 3 frames (60ms) before starting to ensure smooth playback
+        prebuffer_frames = 3
+        buffered = 0
+        frames_buffer = []
         
         try:
-            while self._pacer_running and self._is_running:
+            # Pre-buffer phase
+            while buffered < prebuffer_frames and self._pacer_running:
                 try:
-                    # Wait for next frame
                     frame_msg = await asyncio.wait_for(
                         self._audio_queue.get(),
-                        timeout=1.0
+                        timeout=0.5
                     )
+                    if frame_msg is None:
+                        break
+                    frames_buffer.append(frame_msg)
+                    buffered += 1
+                except asyncio.TimeoutError:
+                    break
+            
+            # Main pacing loop
+            while self._pacer_running and self._is_running:
+                try:
+                    # Get frame from buffer or queue
+                    if frames_buffer:
+                        frame_msg = frames_buffer.pop(0)
+                    else:
+                        # Non-blocking get to maintain timing
+                        try:
+                            frame_msg = self._audio_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            # No frame available, send silence to maintain timing
+                            frame_msg = None
+                    
+                    if frame_msg is None:
+                        # Check for new audio with small timeout
+                        try:
+                            frame_msg = await asyncio.wait_for(
+                                self._audio_queue.get(),
+                                timeout=0.015  # Most of the 20ms window
+                            )
+                        except asyncio.TimeoutError:
+                            # Still no audio, continue loop
+                            await asyncio.sleep(0.005)
+                            continue
                     
                     if frame_msg is None:  # Poison pill
                         break
                     
-                    # Send frame immediately - Twilio buffers on its end
+                    # Wait until next send time for precise 20ms intervals
+                    now = time.time()
+                    wait_time = next_send_time - now
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
+                    
+                    # Send frame
                     await self._send_message(frame_msg)
                     
+                    # Calculate next send time (exactly 20ms later)
+                    next_send_time += frame_duration
+                    
+                    # If we're falling behind, reset timing
+                    if time.time() > next_send_time + 0.040:  # More than 2 frames behind
+                        self._pacer_underruns += 1
+                        if self._pacer_underruns % 10 == 0:
+                            logger.warning(
+                                "Audio pacer reset timing", 
+                                underruns=self._pacer_underruns,
+                                behind_ms=(time.time() - next_send_time)*1000
+                            )
+                        next_send_time = time.time()
+                        
                 except asyncio.TimeoutError:
-                    continue  # No audio, keep waiting
+                    continue  # No audio available, keep waiting
                     
         except asyncio.CancelledError:
             pass
