@@ -27,17 +27,17 @@ def print_header(text: str) -> None:
 
 def print_ok(text: str) -> None:
     """Print success message."""
-    print(f"  ✓ {text}")
+    print(f"  [OK] {text}")
 
 
 def print_error(text: str) -> None:
     """Print error message."""
-    print(f"  ✗ {text}")
+    print(f"  [ERR] {text}")
 
 
 def print_warn(text: str) -> None:
     """Print warning message."""
-    print(f"  ⚠ {text}")
+    print(f"  [WARN] {text}")
 
 
 def check_env_vars() -> bool:
@@ -60,8 +60,12 @@ def check_env_vars() -> bool:
     optional_vars = [
         "PORT",
         "LOG_LEVEL",
+        "DEFAULT_LANGUAGE",
+        "DEEPGRAM_LANGUAGE_EN",
+        "DEEPGRAM_LANGUAGE_FR",
         "ROUTER_ENABLED",
         "CARTESIA_VOICE_ID",
+        "CARTESIA_VOICE_ID_FR",
     ]
     
     all_ok = True
@@ -286,7 +290,7 @@ async def main() -> int:
     print()
     
     if all_passed:
-        print("✓ All checks passed!")
+        print("[OK] All checks passed!")
         print("\nNext steps:")
         print("  1. Run 'make run' to start the server")
         print("  2. Run 'ngrok http 7860' in another terminal")
@@ -295,7 +299,7 @@ async def main() -> int:
         print("  5. Make a test call!")
         return 0
     else:
-        print("✗ Some checks failed. Please fix the issues above.")
+        print("[ERR] Some checks failed. Please fix the issues above.")
         return 1
 
 

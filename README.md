@@ -242,6 +242,18 @@ See `.env.example` for all configuration options.
 | `ROUTER_ENABLED` | `true` | Enable semantic routing |
 | `OUTLINES_ENABLED` | `false` | Use Outlines for extraction |
 
+### Languages (English/French)
+
+The agent supports switching languages mid-call.
+
+- Switch to French: say “speak French”, “switch to French”, or “parle français”
+- Switch to English: say “speak English”, “switch to English”, or “parle anglais”
+
+Optional variables (see `.env.example`):
+- `DEFAULT_LANGUAGE` (default: `en`)
+- `DEEPGRAM_LANGUAGE_EN` / `DEEPGRAM_LANGUAGE_FR`
+- `CARTESIA_VOICE_ID_FR`
+
 ## Creating Cached Audio Files
 
 The semantic router uses pre-rendered audio for fast responses.

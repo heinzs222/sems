@@ -33,6 +33,13 @@ class Config:
     port: int = 7860
     log_level: str = "INFO"
     
+    # Language
+    # - default_language controls the agent's spoken language mode at call start ("en" or "fr")
+    # - deepgram_language_* configure STT language codes passed to Deepgram
+    default_language: str = "en"
+    deepgram_language_en: str = "en-US"
+    deepgram_language_fr: str = "fr"
+    
     # Twilio
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
@@ -43,6 +50,7 @@ class Config:
     # Cartesia (TTS)
     cartesia_api_key: str = ""
     cartesia_voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091"
+    cartesia_voice_id_fr: str = "dd951538-c475-4bde-a3f7-9fd7b3e4d8f5"
     
     # Groq (LLM)
     groq_api_key: str = ""
@@ -102,6 +110,9 @@ class Config:
             public_host=self.public_host,
             port=self.port,
             log_level=self.log_level,
+            default_language=self.default_language,
+            deepgram_language_en=self.deepgram_language_en,
+            deepgram_language_fr=self.deepgram_language_fr,
             groq_model=self.groq_model,
             router_enabled=self.router_enabled,
             outlines_enabled=self.outlines_enabled,
@@ -143,11 +154,19 @@ def get_config() -> Config:
     
     Uses lru_cache to ensure we only load config once.
     """
+    default_language_raw = os.getenv("DEFAULT_LANGUAGE", "en").strip().lower()
+    default_language = "fr" if default_language_raw.startswith("fr") else "en"
+    
     config = Config(
         # Server
         public_host=os.getenv("PUBLIC_HOST", ""),
         port=_get_int("PORT", 7860),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        
+        # Language
+        default_language=default_language,
+        deepgram_language_en=os.getenv("DEEPGRAM_LANGUAGE_EN", "en-US"),
+        deepgram_language_fr=os.getenv("DEEPGRAM_LANGUAGE_FR", "fr"),
         
         # Twilio
         twilio_account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
@@ -159,6 +178,7 @@ def get_config() -> Config:
         # Cartesia
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
         cartesia_voice_id=os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091"),
+        cartesia_voice_id_fr=os.getenv("CARTESIA_VOICE_ID_FR", "dd951538-c475-4bde-a3f7-9fd7b3e4d8f5"),
         
         # Groq
         groq_api_key=os.getenv("GROQ_API_KEY", ""),

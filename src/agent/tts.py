@@ -314,7 +314,8 @@ class TTSManager:
     
     async def synthesize_streaming(
         self, 
-        text: str
+        text: str,
+        voice_id: Optional[str] = None,
     ) -> AsyncGenerator[TTSChunk, None]:
         """
         Synthesize text with streaming.
@@ -328,7 +329,7 @@ class TTSManager:
         if not self._tts:
             self._tts = CartesiaTTS()
         
-        async for chunk in self._tts.synthesize_streaming(text):
+        async for chunk in self._tts.synthesize_streaming(text, voice_id=voice_id):
             yield chunk
     
     @property

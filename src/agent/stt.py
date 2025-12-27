@@ -69,12 +69,14 @@ class DeepgramSTT:
     def __init__(
         self,
         on_transcript: Optional[Callable[[TranscriptionResult], Awaitable[None]]] = None,
+        language: Optional[str] = None,
         config: Optional[Any] = None,
     ):
         if config is None:
             config = get_config()
         
         self.config = config
+        self.language = language or getattr(config, "deepgram_language_en", "en-US")
         self._on_transcript = on_transcript
         self._ws = None
         self._is_connected = False
@@ -108,7 +110,7 @@ class DeepgramSTT:
                 # Flux mode: better turn detection, ~80ms chunks recommended
                 params = (
                     f"?model=nova-2"
-                    f"&language=en-US"
+                    f"&language={self.language}"
                     f"&encoding=mulaw"  # Direct mu-law - no conversion!
                     f"&sample_rate=8000"  # Twilio's native rate
                     f"&channels=1"
@@ -123,7 +125,7 @@ class DeepgramSTT:
                 # Standard mode with mu-law 8kHz - simplified params
                 params = (
                     f"?model=nova-3"
-                    f"&language=en-US"
+                    f"&language={self.language}"
                     f"&encoding=mulaw"
                     f"&sample_rate=8000"
                     f"&channels=1"
@@ -287,9 +289,46 @@ class STTManager:
     ) -> None:
         self._transcript_callback = callback
     
-    async def start(self) -> bool:
-        self._stt = DeepgramSTT(on_transcript=self._transcript_callback)
-        return await self._stt.connect()
+    async def start(self, language: Optional[str] = None) -> bool:
+        return await self.restart(language=language)
+    
+    async def restart(self, language: Optional[str] = None) -> bool:
+        """
+        (Re)start STT, optionally changing language.
+        
+        If STT is already running, this attempts to connect the new STT first and
+        only swaps over on success (to avoid dropping the existing connection).
+        """
+        # If there is no active STT, just start a new one.
+        if self._stt is None:
+            self._stt = DeepgramSTT(
+                on_transcript=self._transcript_callback,
+                language=language,
+            )
+            return await self._stt.connect()
+        
+        previous = self._stt
+        candidate = DeepgramSTT(
+            on_transcript=self._transcript_callback,
+            language=language,
+        )
+        
+        ok = await candidate.connect()
+        if not ok:
+            try:
+                await candidate.disconnect()
+            except Exception:
+                pass
+            return False
+        
+        # Swap to the new STT and then close the previous one.
+        self._stt = candidate
+        try:
+            await previous.disconnect()
+        except Exception:
+            pass
+        
+        return True
     
     async def stop(self) -> None:
         if self._stt:

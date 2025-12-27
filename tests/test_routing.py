@@ -171,10 +171,11 @@ class TestTryRoute:
     def test_try_route_no_match(self):
         """Test try_route when no route matches."""
         from src.agent.routing import SemanticRouter
+        from types import SimpleNamespace
         
         router = SemanticRouter()
         router._initialized = True
-        router._router = MagicMock(return_value=MagicMock(name=None))
+        router._router = MagicMock(return_value=SimpleNamespace(name=None))
         
         route_name, chunks, should_hangup = router.try_route("random question")
         
