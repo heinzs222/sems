@@ -46,6 +46,9 @@ class Config:
     
     # Deepgram (STT)
     deepgram_api_key: str = ""
+    deepgram_eager_eot_threshold: float = 0.38
+    deepgram_eot_threshold: float = 0.74
+    deepgram_eot_timeout_ms: int = 6500
     
     # Cartesia (TTS)
     cartesia_api_key: str = ""
@@ -114,6 +117,9 @@ class Config:
             default_language=self.default_language,
             deepgram_language_en=self.deepgram_language_en,
             deepgram_language_fr=self.deepgram_language_fr,
+            deepgram_eager_eot_threshold=self.deepgram_eager_eot_threshold,
+            deepgram_eot_threshold=self.deepgram_eot_threshold,
+            deepgram_eot_timeout_ms=self.deepgram_eot_timeout_ms,
             groq_model=self.groq_model,
             router_enabled=self.router_enabled,
             menu_only=self.menu_only,
@@ -176,6 +182,9 @@ def get_config() -> Config:
         
         # Deepgram
         deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
+        deepgram_eager_eot_threshold=_get_float("DEEPGRAM_EAGER_EOT_THRESHOLD", 0.38),
+        deepgram_eot_threshold=_get_float("DEEPGRAM_EOT_THRESHOLD", 0.74),
+        deepgram_eot_timeout_ms=_get_int("DEEPGRAM_EOT_TIMEOUT_MS", 6500),
         
         # Cartesia
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),

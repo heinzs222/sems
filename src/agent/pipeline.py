@@ -19,6 +19,7 @@ Features:
 
 import asyncio
 import re
+import audioop
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Awaitable, List, Dict, Any
 from enum import Enum
@@ -126,6 +127,18 @@ _GOODBYE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 
 _CA_POSTAL_RE = re.compile(r"\\b([a-z]\\d[a-z])\\s?(\\d[a-z]\\d)\\b", re.IGNORECASE)
 
+_BARGE_IN_BACKCHANNEL_RE = re.compile(
+    r"^(ok|okay|yeah|yep|yup|uh huh|uh-huh|mhm|mm hmm|mm-hmm|oui|ouais|d['’]accord|daccord)([.!?])?$"
+)
+
+_BARGE_IN_HARD_PHRASE_RE = re.compile(
+    r"\\b(stop|wait|hold on|one second|pause|cancel|actually|listen|arrete|attends|un instant|annule|ecoute)\\b"
+)
+
+_BARGE_IN_RMS_THRESHOLD = 500
+_BARGE_IN_HARD_CONTINUED_MS = 150
+_BARGE_IN_BACKCHANNEL_CONTINUED_MS = 400
+
 @dataclass
 class TurnMetrics:
     """Metrics for a single conversation turn."""
@@ -182,6 +195,14 @@ class QueuedTranscript:
     stt_latency_ms: float = 0.0
     detected_language: Optional[str] = None
     language_confidence: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class OutboundMessage:
+    """Message to send to Twilio, optionally paced as audio."""
+
+    message: str
+    pace: bool = True  # True for 20ms media frames; False for control (mark/clear/etc.)
 
 
 class VoicePipeline:
@@ -245,12 +266,21 @@ class VoicePipeline:
         # Output task (e.g., greeting) and barge-in gating
         self._output_task: Optional[asyncio.Task] = None
         self._speech_started_during_tts: bool = False
+        self._tts_soft_paused: bool = False
+        self._barge_in_soft_started_at: float = 0.0
+        self._barge_in_consecutive_speech_ms: int = 0
+        self._barge_in_last_rms: int = 0
+        self._barge_in_partial_text: str = ""
+        self._barge_in_partial_words: int = 0
+        self._barge_in_is_backchannel: bool = False
+        self._soft_interrupt_watchdog_task: Optional[asyncio.Task] = None
         
         # Outbound audio pacer (Late-2025 best practice)
-        self._audio_queue: asyncio.Queue = asyncio.Queue()
+        self._outbound_queue: asyncio.Queue = asyncio.Queue()
         self._pacer_task: Optional[asyncio.Task] = None
         self._pacer_running: bool = False
         self._pacer_underruns: int = 0
+        self._queue_depth_max: int = 0
         self._jitter_buffer_ms: int = 100  # Buffer 100ms before starting playback
         self._outbound_ulaw_remainder: bytes = b""
         
@@ -269,6 +299,125 @@ class VoicePipeline:
         if self._lang_state.current == "fr":
             return self.config.cartesia_voice_id_fr or self.config.cartesia_voice_id
         return self.config.cartesia_voice_id
+
+    @staticmethod
+    def _split_sentences(text: str) -> List[str]:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return []
+
+        # Simple sentence boundary split (good enough for PSTN turn-taking).
+        parts = re.split(r"(?<=[.!?])\s+|\n+", cleaned)
+        sentences = [p.strip() for p in parts if p and p.strip()]
+        return sentences or [cleaned]
+
+    @staticmethod
+    def _is_barge_in_backchannel(text: str) -> bool:
+        t = _normalize_for_intent(text)
+        return bool(t and _BARGE_IN_BACKCHANNEL_RE.match(t))
+
+    @staticmethod
+    def _contains_hard_interrupt_phrase(text: str) -> bool:
+        t = _normalize_for_intent(text)
+        return bool(t and _BARGE_IN_HARD_PHRASE_RE.search(t))
+
+    def _begin_soft_interrupt(self, *, reason: str) -> None:
+        if self._state != PipelineState.SPEAKING:
+            return
+        if self._tts_soft_paused:
+            return
+
+        now = time.time()
+        self._tts_soft_paused = True
+        self._speech_started_during_tts = False
+        self._barge_in_soft_started_at = now
+        self._barge_in_consecutive_speech_ms = 0
+        self._barge_in_last_rms = 0
+        self._barge_in_partial_text = ""
+        self._barge_in_partial_words = 0
+        self._barge_in_is_backchannel = False
+
+        if self._soft_interrupt_watchdog_task and not self._soft_interrupt_watchdog_task.done():
+            self._soft_interrupt_watchdog_task.cancel()
+        self._soft_interrupt_watchdog_task = asyncio.create_task(
+            self._soft_interrupt_watchdog(started_at=now)
+        )
+
+        logger.info(
+            "Barge-in soft interrupt",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+            barge_in_soft_ms=0.0,
+        )
+
+    def _clear_soft_interrupt(self, *, reason: str) -> None:
+        if not self._tts_soft_paused:
+            return
+
+        self._tts_soft_paused = False
+        self._barge_in_soft_started_at = 0.0
+        self._barge_in_consecutive_speech_ms = 0
+        self._barge_in_last_rms = 0
+        self._barge_in_partial_text = ""
+        self._barge_in_partial_words = 0
+        self._barge_in_is_backchannel = False
+
+        if self._soft_interrupt_watchdog_task and not self._soft_interrupt_watchdog_task.done():
+            self._soft_interrupt_watchdog_task.cancel()
+        self._soft_interrupt_watchdog_task = None
+
+        logger.debug(
+            "Barge-in soft interrupt cleared",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+        )
+
+    async def _soft_interrupt_watchdog(self, *, started_at: float) -> None:
+        try:
+            await asyncio.sleep(0.25)
+            if (
+                not self._is_running
+                or self._state != PipelineState.SPEAKING
+                or not self._tts_soft_paused
+                or self._barge_in_soft_started_at != started_at
+            ):
+                return
+
+            # If we aren't currently seeing continued speech energy, resume speaking.
+            if self._barge_in_consecutive_speech_ms == 0:
+                self._clear_soft_interrupt(reason="watchdog")
+        except asyncio.CancelledError:
+            pass
+
+    async def _maybe_hard_interrupt_from_energy(self, ulaw_bytes: bytes) -> None:
+        if (
+            self._state != PipelineState.SPEAKING
+            or not self._tts_soft_paused
+            or not ulaw_bytes
+        ):
+            return
+
+        try:
+            pcm = audioop.ulaw2lin(ulaw_bytes, 2)
+            rms = audioop.rms(pcm, 2)
+        except Exception:
+            rms = 0
+
+        self._barge_in_last_rms = rms
+
+        if rms >= _BARGE_IN_RMS_THRESHOLD:
+            self._barge_in_consecutive_speech_ms += 20
+        else:
+            self._barge_in_consecutive_speech_ms = 0
+
+        threshold_ms = _BARGE_IN_HARD_CONTINUED_MS
+        if self._barge_in_is_backchannel and self._barge_in_partial_words <= 1:
+            threshold_ms = _BARGE_IN_BACKCHANNEL_CONTINUED_MS
+
+        if self._barge_in_consecutive_speech_ms >= threshold_ms:
+            await self._handle_hard_interrupt(reason="continued_speech")
 
     @staticmethod
     def _matches_any(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
@@ -645,6 +794,7 @@ class VoicePipeline:
             self._turn_worker_task,
             self._silence_task,
             self._stt_start_task,
+            self._soft_interrupt_watchdog_task,
         ):
             if task and not task.done():
                 task.cancel()
@@ -664,11 +814,18 @@ class VoicePipeline:
         
         # Finalize metrics
         self._call_metrics.end_time = time.time()
-        
-        logger.info(
-            "Voice pipeline stopped",
-            metrics=self._call_metrics.to_dict(),
+
+        call_state = self._protocol.call_state
+        metrics = self._call_metrics.to_dict()
+        metrics.update(
+            {
+                "underflows": self._pacer_underruns,
+                "queue_depth_max": self._queue_depth_max,
+                "mark_rtt_ms": round(call_state.avg_mark_rtt_ms, 2) if call_state else 0.0,
+            }
         )
+
+        logger.info("Voice pipeline stopped", metrics=metrics)
     
     async def handle_message(self, raw_message: str) -> None:
         """
@@ -693,7 +850,16 @@ class VoicePipeline:
             await self._handle_media(event)
             
         elif event_type == TwilioEventType.MARK:
-            self._protocol.handle_mark(event)
+            rtt_ms = self._protocol.handle_mark(event)
+            if rtt_ms:
+                call_state = self._protocol.call_state
+                logger.debug(
+                    "Twilio mark ack",
+                    mark_name=event.name,
+                    mark_rtt_ms=round(rtt_ms, 2),
+                    avg_mark_rtt_ms=round(call_state.avg_mark_rtt_ms, 2) if call_state else 0.0,
+                    playback_generation_id=getattr(call_state, "playback_generation_id", None),
+                )
             
         elif event_type == TwilioEventType.DTMF:
             logger.info("DTMF received", digit=event.digit)
@@ -772,6 +938,10 @@ class VoicePipeline:
             # Start silence detection if not already running
             if self._silence_task is None or self._silence_task.done():
                 self._silence_task = asyncio.create_task(self._silence_detector())
+
+            # Two-stage barge-in: while speaking and soft-paused, detect continued user speech via energy.
+            if self._state == PipelineState.SPEAKING and self._tts_soft_paused:
+                await self._maybe_hard_interrupt_from_energy(audio)
     
     async def _on_speech_started(self) -> None:
         """Handle VAD speech-start event from STT (used for barge-in)."""
@@ -780,6 +950,7 @@ class VoicePipeline:
         
         if self._state == PipelineState.SPEAKING:
             self._speech_started_during_tts = True
+            self._begin_soft_interrupt(reason="vad")
             logger.debug("Speech started detected during TTS")
 
     async def _on_transcript(self, result: TranscriptionResult) -> None:
@@ -802,29 +973,53 @@ class VoicePipeline:
                 text=result.text[:80],
             )
         
-        # Check for interruption during TTS
+        # Two-stage interruption while speaking:
+        # - Soft: pause TTS enqueue on credible speech onset.
+        # - Hard: Twilio clear + cancel TTS/LLM on confirmed interruption.
         if self._state == PipelineState.SPEAKING:
-            word_count = len(result.text.split())
-            
-            # Active collision (cough filter):
-            # If VAD says speech started, interrupt on the first interim word.
-            if self._speech_started_during_tts and word_count >= 1:
-                logger.info(
-                    "Interruption detected (speech_started latch)",
-                    word_count=word_count,
-                )
-                await self._handle_interruption()
-                self._pending_transcript = result.text
-                self._speech_started_during_tts = False
-            
-            elif word_count >= self.config.min_interruption_words:
-                logger.info(
-                    "Interruption detected",
-                    word_count=word_count,
-                    threshold=self.config.min_interruption_words,
-                )
-                await self._handle_interruption()
-                self._pending_transcript = result.text
+            text = (result.text or "").strip()
+            if text:
+                word_count = len(text.split())
+                self._barge_in_partial_text = text
+                self._barge_in_partial_words = word_count
+                self._barge_in_is_backchannel = self._is_barge_in_backchannel(text)
+
+                if not self._tts_soft_paused and (self._speech_started_during_tts or word_count >= 1):
+                    self._begin_soft_interrupt(
+                        reason="speech_started" if self._speech_started_during_tts else "interim"
+                    )
+                    self._speech_started_during_tts = False
+
+                if self._contains_hard_interrupt_phrase(text):
+                    logger.info(
+                        "Interruption confirmed",
+                        reason="phrase",
+                        word_count=word_count,
+                    )
+                    self._pending_transcript = text
+                    await self._handle_hard_interrupt(reason="phrase")
+                    return
+
+                hard_word_threshold = max(2, self.config.min_interruption_words)
+                if word_count >= hard_word_threshold and not self._barge_in_is_backchannel:
+                    logger.info(
+                        "Interruption confirmed",
+                        reason="words",
+                        word_count=word_count,
+                        threshold=hard_word_threshold,
+                    )
+                    self._pending_transcript = text
+                    await self._handle_hard_interrupt(reason="words")
+                    return
+
+            # Backchannels while the agent is talking should not trigger a hard interrupt.
+            if (result.is_final or result.speech_final) and self._is_barge_in_backchannel(result.text):
+                if self._tts_soft_paused:
+                    self._clear_soft_interrupt(reason="backchannel_final")
+                return
+
+            # Do not process transcripts into turns while the agent is still speaking.
+            return
         
         # Process final transcripts.
         #
@@ -856,16 +1051,34 @@ class VoicePipeline:
                 )
             )
     
-    async def _handle_interruption(self) -> None:
-        """Handle user interruption during TTS playback."""
+    async def _handle_hard_interrupt(self, *, reason: str) -> None:
+        """Hard interrupt (barge-in): clear Twilio + cancel active tasks."""
         if self._state != PipelineState.SPEAKING:
             return
-        
-        logger.info("Processing interruption")
+
+        now = time.time()
+        barge_in_hard_ms = (
+            (now - self._barge_in_soft_started_at) * 1000
+            if self._barge_in_soft_started_at
+            else 0.0
+        )
+
+        logger.info(
+            "Barge-in hard interrupt",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+            barge_in_hard_ms=round(barge_in_hard_ms, 2),
+            last_rms=self._barge_in_last_rms,
+            consecutive_speech_ms=self._barge_in_consecutive_speech_ms,
+            partial_words=self._barge_in_partial_words,
+            is_backchannel=self._barge_in_is_backchannel,
+        )
         
         self._state = PipelineState.INTERRUPTED
         self._call_metrics.total_interruptions += 1
         self._speech_started_during_tts = False
+        self._clear_soft_interrupt(reason="hard")
         
         if self._current_turn_metrics:
             self._current_turn_metrics.was_interrupted = True
@@ -891,6 +1104,9 @@ class VoicePipeline:
         self._tts.cancel_current()
         tasks.append(asyncio.create_task(self._stop_pacer()))
         self._outbound_ulaw_remainder = b""
+
+        # Bump playback generation so any late mark acks are ignored after `clear`.
+        self._protocol.bump_playback_generation()
         
         clear_msg = self._protocol.create_clear()
         if clear_msg:
@@ -1180,14 +1396,15 @@ class VoicePipeline:
             # Pre-buffer phase
             while buffered < prebuffer_frames and self._pacer_running:
                 try:
-                    frame_msg = await asyncio.wait_for(
-                        self._audio_queue.get(),
+                    outbound = await asyncio.wait_for(
+                        self._outbound_queue.get(),
                         timeout=0.5
                     )
-                    if frame_msg is None:
+                    if outbound is None:
                         break
-                    frames_buffer.append(frame_msg)
-                    buffered += 1
+                    frames_buffer.append(outbound)
+                    if outbound.pace:
+                        buffered += 1
                 except asyncio.TimeoutError:
                     break
             
@@ -1196,20 +1413,20 @@ class VoicePipeline:
                 try:
                     # Get frame from buffer or queue
                     if frames_buffer:
-                        frame_msg = frames_buffer.pop(0)
+                        outbound = frames_buffer.pop(0)
                     else:
                         # Non-blocking get to maintain timing
                         try:
-                            frame_msg = self._audio_queue.get_nowait()
+                            outbound = self._outbound_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             # No frame available, send silence to maintain timing
-                            frame_msg = None
+                            outbound = None
                     
-                    if frame_msg is None:
+                    if outbound is None:
                         # Check for new audio with small timeout
                         try:
-                            frame_msg = await asyncio.wait_for(
-                                self._audio_queue.get(),
+                            outbound = await asyncio.wait_for(
+                                self._outbound_queue.get(),
                                 timeout=0.015  # Most of the 20ms window
                             )
                         except asyncio.TimeoutError:
@@ -1217,8 +1434,14 @@ class VoicePipeline:
                             await asyncio.sleep(0.005)
                             continue
                     
-                    if frame_msg is None:  # Poison pill
+                    if outbound is None:  # Poison pill
                         break
+
+                    if not outbound.pace:
+                        # Control frames (mark/clear/etc.) should be sent immediately and must not
+                        # consume an audio pacing slot.
+                        await self._send_message(outbound.message)
+                        continue
                     
                     # Wait until next send time for precise 20ms intervals
                     now = time.time()
@@ -1227,7 +1450,7 @@ class VoicePipeline:
                         await asyncio.sleep(wait_time)
                     
                     # Send frame
-                    await self._send_message(frame_msg)
+                    await self._send_message(outbound.message)
                     
                     # Calculate next send time (exactly 20ms later)
                     next_send_time += frame_duration
@@ -1254,7 +1477,7 @@ class VoicePipeline:
     async def _start_pacer(self) -> None:
         """Start the audio pacer task."""
         if self._pacer_task is None or self._pacer_task.done():
-            self._audio_queue = asyncio.Queue()
+            self._outbound_queue = asyncio.Queue()
             self._pacer_task = asyncio.create_task(self._audio_pacer())
     
     async def _stop_pacer(self) -> None:
@@ -1262,14 +1485,14 @@ class VoicePipeline:
         self._pacer_running = False
         
         # Clear the queue
-        while not self._audio_queue.empty():
+        while not self._outbound_queue.empty():
             try:
-                self._audio_queue.get_nowait()
+                self._outbound_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
         
         # Send poison pill
-        await self._audio_queue.put(None)
+        await self._outbound_queue.put(None)
         
         if self._pacer_task and not self._pacer_task.done():
             self._pacer_task.cancel()
@@ -1277,6 +1500,19 @@ class VoicePipeline:
                 await self._pacer_task
             except asyncio.CancelledError:
                 pass
+
+    async def _enqueue_outbound(self, message: str, *, pace: bool) -> None:
+        """Enqueue an outbound message and track queue depth."""
+        if not message:
+            return
+
+        await self._outbound_queue.put(OutboundMessage(message, pace=pace))
+        try:
+            depth = self._outbound_queue.qsize()
+        except Exception:
+            return
+        if depth > self._queue_depth_max:
+            self._queue_depth_max = depth
     
     async def _speak_response(self, text: str) -> None:
         """
@@ -1303,46 +1539,75 @@ class VoicePipeline:
 
             voice_id = self._current_cartesia_voice_id()
 
-            async for chunk in self._tts.synthesize_streaming(text, voice_id=voice_id):
+            # Best practice: Insert marks at sentence boundaries to track real playback and
+            # make interruptions feel clean.
+            for segment in self._split_sentences(text):
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
                     break
 
-                if chunk.audio_bytes:
-                    if first_audio_time is None:
-                        first_audio_time = time.time()
-                        if self._current_turn_metrics:
-                            self._current_turn_metrics.tts_start_ms = (
-                                first_audio_time - tts_start
-                            ) * 1000
-                    
-                    # Queue audio frames to pacer for smooth playback.
-                    # Preserve framing across streaming chunks to avoid injecting padding between chunks.
-                    self._outbound_ulaw_remainder += chunk.audio_bytes
+                async for chunk in self._tts.synthesize_streaming(segment, voice_id=voice_id):
+                    if not self._is_running or self._state == PipelineState.INTERRUPTED:
+                        break
+
+                    if chunk.audio_bytes:
+                        if first_audio_time is None:
+                            first_audio_time = time.time()
+                            if self._current_turn_metrics:
+                                self._current_turn_metrics.tts_start_ms = (
+                                    first_audio_time - tts_start
+                                ) * 1000
+
+                        # Queue audio frames to pacer for smooth playback.
+                        # Preserve framing across streaming chunks to avoid injecting padding between chunks.
+                        self._outbound_ulaw_remainder += chunk.audio_bytes
+                        while (
+                            not self._tts_soft_paused
+                            and len(self._outbound_ulaw_remainder) >= TWILIO_FRAME_SIZE
+                        ):
+                            frame = self._outbound_ulaw_remainder[:TWILIO_FRAME_SIZE]
+                            self._outbound_ulaw_remainder = self._outbound_ulaw_remainder[TWILIO_FRAME_SIZE:]
+                            msg = create_media_message(self._protocol.stream_sid, frame)
+                            await self._enqueue_outbound(msg, pace=True)
+
+                    if (
+                        chunk.is_final
+                        and self._outbound_ulaw_remainder
+                        and not self._tts_soft_paused
+                    ):
+                        frame = self._outbound_ulaw_remainder.ljust(TWILIO_FRAME_SIZE, b"\xff")
+                        self._outbound_ulaw_remainder = b""
+                        msg = create_media_message(self._protocol.stream_sid, frame)
+                        await self._enqueue_outbound(msg, pace=True)
+
+                # If we soft-paused mid-sentence (backchannel/noise), wait briefly for resume so we
+                # can flush the buffered tail and place a correct mark.
+                while self._tts_soft_paused and self._is_running and self._state == PipelineState.SPEAKING:
+                    await asyncio.sleep(0.01)
+
+                if not self._is_running or self._state == PipelineState.INTERRUPTED:
+                    break
+
+                if self._outbound_ulaw_remainder:
                     while len(self._outbound_ulaw_remainder) >= TWILIO_FRAME_SIZE:
                         frame = self._outbound_ulaw_remainder[:TWILIO_FRAME_SIZE]
                         self._outbound_ulaw_remainder = self._outbound_ulaw_remainder[TWILIO_FRAME_SIZE:]
                         msg = create_media_message(self._protocol.stream_sid, frame)
-                        await self._audio_queue.put(msg)
+                        await self._enqueue_outbound(msg, pace=True)
 
-                if chunk.is_final and self._outbound_ulaw_remainder:
-                    frame = self._outbound_ulaw_remainder.ljust(TWILIO_FRAME_SIZE, b"\xff")
-                    self._outbound_ulaw_remainder = b""
-                    msg = create_media_message(self._protocol.stream_sid, frame)
-                    await self._audio_queue.put(msg)
+                    if self._outbound_ulaw_remainder:
+                        frame = self._outbound_ulaw_remainder.ljust(TWILIO_FRAME_SIZE, b"\xff")
+                        self._outbound_ulaw_remainder = b""
+                        msg = create_media_message(self._protocol.stream_sid, frame)
+                        await self._enqueue_outbound(msg, pace=True)
+
+                mark_msg = self._protocol.create_mark()
+                if mark_msg:
+                    await self._enqueue_outbound(mark_msg, pace=False)
             
             # Record TTS metrics
             if self._current_turn_metrics:
                 self._current_turn_metrics.tts_total_ms = (time.time() - tts_start) * 1000
             
-            # Wait for queue to drain before sending mark
-            while not self._audio_queue.empty() and self._state == PipelineState.SPEAKING:
-                await asyncio.sleep(0.01)
-            
-            # Send mark to track when audio finishes
-            mark_msg = self._protocol.create_mark()
-            if mark_msg:
-                await self._send_message(mark_msg)
-                
         except asyncio.CancelledError:
             logger.debug("TTS streaming cancelled")
         except Exception as e:

@@ -139,6 +139,8 @@ class CallState:
     account_sid: str = ""
     sequence_number: int = 0
     is_active: bool = True
+    playback_generation_id: int = 0
+    mark_sequence: int = 0
     pending_marks: Dict[str, float] = field(default_factory=dict)  # mark_name -> send_time
     mark_rtt_samples: List[float] = field(default_factory=list)  # RTT samples in ms
     
@@ -331,6 +333,18 @@ class TwilioProtocolHandler:
         import time
         rtt_ms = 0.0
         if self.call_state:
+            mark_gen = self._parse_mark_generation(event.name)
+            if (
+                mark_gen is not None
+                and mark_gen != self.call_state.playback_generation_id
+            ):
+                logger.debug(
+                    "Ignoring stale mark acknowledgment",
+                    mark_name=event.name,
+                    mark_generation=mark_gen,
+                    current_generation=self.call_state.playback_generation_id,
+                )
+                return 0.0
             send_time = self.call_state.pending_marks.pop(event.name, None)
             if send_time:
                 rtt_ms = (time.time() - send_time) * 1000
@@ -378,12 +392,31 @@ class TwilioProtocolHandler:
         
         if name is None:
             self._mark_counter += 1
-            name = f"mark_{self._mark_counter}"
+            self.call_state.mark_sequence += 1
+            name = f"g{self.call_state.playback_generation_id}_m{self.call_state.mark_sequence}"
         
         import time
         self.call_state.pending_marks[name] = time.time()  # Store send time for RTT calculation
         return create_mark_message(self.call_state.stream_sid, name)
-    
+
+    def bump_playback_generation(self) -> int:
+        """
+        Bump the playback generation id.
+
+        Used to ignore stale marks after a Twilio `clear` (barge-in).
+        """
+        if not self.call_state:
+            return 0
+
+        self.call_state.playback_generation_id += 1
+        self.call_state.mark_sequence = 0
+        self.call_state.pending_marks.clear()
+        logger.info(
+            "Playback generation bumped",
+            playback_generation_id=self.call_state.playback_generation_id,
+        )
+        return self.call_state.playback_generation_id
+
     def create_clear(self) -> str:
         """
         Create a clear message to flush buffered audio.
@@ -396,3 +429,23 @@ class TwilioProtocolHandler:
         
         logger.info("Clearing Twilio audio buffer", stream_sid=self.call_state.stream_sid)
         return create_clear_message(self.call_state.stream_sid)
+
+    @staticmethod
+    def _parse_mark_generation(mark_name: str) -> Optional[int]:
+        """
+        Parse a playback generation id from a mark name.
+
+        Expected format for auto-generated marks: `g{gen}_m{seq}`.
+        Returns None if the format doesn't match.
+        """
+        if not isinstance(mark_name, str):
+            return None
+        if not mark_name.startswith("g"):
+            return None
+        try:
+            # g{gen}_m{seq}
+            gen_part = mark_name.split("_", 1)[0]
+            gen_str = gen_part[1:]
+            return int(gen_str)
+        except Exception:
+            return None

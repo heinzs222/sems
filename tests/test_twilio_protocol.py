@@ -269,8 +269,33 @@ class TestProtocolHandler:
         parsed1 = json.loads(mark1)
         parsed2 = json.loads(mark2)
         
-        assert parsed1["mark"]["name"] == "mark_1"
+        assert parsed1["mark"]["name"] == "g0_m1"
         assert parsed2["mark"]["name"] == "custom_mark"
+
+    def test_handler_mark_generation_and_stale_acks(self):
+        """Stale mark acks (previous generation) should be ignored after clear."""
+        handler = TwilioProtocolHandler()
+        handler.handle_start(
+            TwilioStartEvent(
+                stream_sid="MZ123",
+                call_sid="CA456",
+                account_sid="AC789",
+                tracks=[],
+            )
+        )
+
+        mark1 = json.loads(handler.create_mark())["mark"]["name"]
+        assert mark1 == "g0_m1"
+
+        handler.bump_playback_generation()
+        mark2 = json.loads(handler.create_mark())["mark"]["name"]
+        assert mark2 == "g1_m1"
+
+        # Simulate a late ack for a mark from the previous generation.
+        handler.call_state.pending_marks[mark1] = 123.0
+        rtt = handler.handle_mark(TwilioMarkEvent(stream_sid="MZ123", name=mark1))
+        assert rtt == 0.0
+        assert mark1 in handler.call_state.pending_marks
     
     def test_handler_create_clear(self):
         """Test creating clear messages."""

@@ -19,6 +19,7 @@ import structlog
 import websockets
 
 from src.agent.config import get_config
+from src.agent.audio import FLUX_FRAME_SIZE
 import os
 
 logger = structlog.get_logger(__name__)
@@ -96,6 +97,8 @@ class DeepgramSTT:
         self._receive_task = None
         self._detected_language: Optional[str] = None
         self._language_confidence: Optional[float] = None
+        self._uses_flux: bool = False
+        self._flux_remainder: bytes = b""
     
     @property
     def is_connected(self) -> bool:
@@ -139,13 +142,19 @@ class DeepgramSTT:
 
             # Candidate 1: v2 (Flux) if supported by the account.
             if not USE_DEEPGRAM_V1_ONLY and not _DEEPGRAM_V2_DISABLED:
+                flux_params = (
+                    f"&eager_eot_threshold={self.config.deepgram_eager_eot_threshold}"
+                    f"&eot_threshold={self.config.deepgram_eot_threshold}"
+                    f"&eot_timeout_ms={self.config.deepgram_eot_timeout_ms}"
+                )
                 candidates.append(
                     (
                         "v2_nova-3_multi",
                         DEEPGRAM_V2_URL
                         + common
                         + "&vad_events=true"
-                        + "&language=multi",
+                        + "&language=multi"
+                        + flux_params,
                     )
                 )
 
@@ -162,6 +171,7 @@ class DeepgramSTT:
             )
 
             last_error: Optional[BaseException] = None
+            chosen_label: Optional[str] = None
             for label, url in candidates:
                 try:
                     logger.info("Connecting to Deepgram", endpoint=label)
@@ -171,6 +181,7 @@ class DeepgramSTT:
                         open_timeout=10,
                     )
                     logger.info("Deepgram STT connected", endpoint=label)
+                    chosen_label = label
                     break
                 except Exception as e:
                     last_error = e
@@ -195,6 +206,8 @@ class DeepgramSTT:
                 )
 
             self._is_connected = True
+            self._uses_flux = bool(chosen_label and chosen_label.startswith("v2_"))
+            self._flux_remainder = b""
             
             # Start receiving messages
             self._receive_task = asyncio.create_task(self._receive_loop())
@@ -211,6 +224,8 @@ class DeepgramSTT:
     async def disconnect(self) -> None:
         """Disconnect from Deepgram."""
         self._is_connected = False
+        self._uses_flux = False
+        self._flux_remainder = b""
         
         if self._receive_task:
             self._receive_task.cancel()
@@ -235,8 +250,18 @@ class DeepgramSTT:
         
         try:
             self._last_audio_time = time.time()
-            self._metrics.total_audio_ms += len(audio_bytes) / 32
-            await self._ws.send(audio_bytes)
+            # mu-law 8kHz: 8000 bytes/sec -> 8 bytes/ms
+            self._metrics.total_audio_ms += len(audio_bytes) / 8
+
+            if self._uses_flux:
+                # Deepgram Flux best practice: send ~80ms chunks (640 bytes at 8kHz mu-law).
+                self._flux_remainder += audio_bytes
+                while len(self._flux_remainder) >= FLUX_FRAME_SIZE:
+                    chunk = self._flux_remainder[:FLUX_FRAME_SIZE]
+                    self._flux_remainder = self._flux_remainder[FLUX_FRAME_SIZE:]
+                    await self._ws.send(chunk)
+            else:
+                await self._ws.send(audio_bytes)
         except Exception as e:
             logger.error("Failed to send audio to Deepgram", error=str(e))
     
@@ -336,6 +361,12 @@ class DeepgramSTT:
                 await self._on_transcript(result)
             self._current_transcript = ""
             self._word_count = 0
+
+        elif msg_type_norm in ("eagerendofturn", "eager_end_of_turn", "eager-end-of-turn"):
+            logger.debug("Flux eager end of turn")
+
+        elif msg_type_norm in ("turnresumed", "turn_resumed", "turn-resumed"):
+            logger.debug("Flux turn resumed")
             
         elif msg_type_norm == "error":
             logger.error(
