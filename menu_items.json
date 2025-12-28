@@ -1,0 +1,252 @@
+{
+  "source": "menu.html",
+  "num_sections": 9,
+  "num_items": 40,
+  "sections": [
+    {
+      "name": "Boissons",
+      "items": [
+        {
+          "name": "Matcha avec mousse à la fraise",
+          "price": "$8.50",
+          "price_cents": 850
+        }
+      ]
+    },
+    {
+      "name": "Boites De 12 Mini-Crepes",
+      "items": [
+        {
+          "name": "Choco-Blanco",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Pistachio",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Lotus",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Choco-Banane",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Sirop d'érable",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Décadent",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "S'mores",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Shortcake au fraise",
+          "price": "$15.45",
+          "price_cents": 1545
+        },
+        {
+          "name": "Personnalisé",
+          "price": "$16.45",
+          "price_cents": 1645
+        }
+      ]
+    },
+    {
+      "name": "Boites De 30 Mini-Crêpes",
+      "items": [
+        {
+          "name": "Boites De 30 Mini-Crêpes",
+          "price": "$28.15",
+          "price_cents": 2815
+        }
+      ]
+    },
+    {
+      "name": "Boites de 50 mini-crêpes",
+      "items": [
+        {
+          "name": "Boites de 50 mini-crêpes",
+          "price": "$40.15",
+          "price_cents": 4015
+        }
+      ]
+    },
+    {
+      "name": "Chocolat Dubaï",
+      "items": [
+        {
+          "name": "Fraise chocolat dubaï",
+          "price": "$14.81",
+          "price_cents": 1481
+        },
+        {
+          "name": "Boîte Fondue Chocolat Dubaï",
+          "price": "$32.70",
+          "price_cents": 3270
+        }
+      ]
+    },
+    {
+      "name": "Extra",
+      "items": [
+        {
+          "name": "Banane",
+          "price": "$2.00",
+          "price_cents": 200
+        },
+        {
+          "name": "Fraise",
+          "price": "$2.00",
+          "price_cents": 200
+        },
+        {
+          "name": "Amandes tranchées",
+          "price": "$1.50",
+          "price_cents": 150
+        },
+        {
+          "name": "Chocolat au lait",
+          "price": "$2.00",
+          "price_cents": 200
+        },
+        {
+          "name": "Chocolat blanc",
+          "price": "$2.00",
+          "price_cents": 200
+        },
+        {
+          "name": "Smarties",
+          "price": "$1.50",
+          "price_cents": 150
+        },
+        {
+          "name": "Mini eggs",
+          "price": "$1.50",
+          "price_cents": 150
+        },
+        {
+          "name": "Crème de pistache",
+          "price": "$2.00",
+          "price_cents": 200
+        },
+        {
+          "name": "Crème de biscoff",
+          "price": "$2.00",
+          "price_cents": 200
+        }
+      ]
+    },
+    {
+      "name": "Thé Au Fruit",
+      "items": [
+        {
+          "name": "Mangue",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Fruit De La Passion",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Pêche",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Litchi",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Fraise",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Ananas",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Citron & Miel",
+          "price": "$8.55",
+          "price_cents": 855
+        }
+      ]
+    },
+    {
+      "name": "Thé Au Lait",
+      "items": [
+        {
+          "name": "Noix De Coco",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Taro",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Mocha",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Sucre brun",
+          "price": "$8.55",
+          "price_cents": 855
+        },
+        {
+          "name": "Matcha",
+          "price": "$8.55",
+          "price_cents": 855
+        }
+      ]
+    },
+    {
+      "name": "Tiramisu",
+      "items": [
+        {
+          "name": "Tiramisu pistache",
+          "price": "$9.50",
+          "price_cents": 950
+        },
+        {
+          "name": "Tiramisu chocolat Dubaï",
+          "price": "$9.50",
+          "price_cents": 950
+        },
+        {
+          "name": "Tiramisu lotus",
+          "price": "$9.50",
+          "price_cents": 950
+        },
+        {
+          "name": "Tiramisu classique",
+          "price": "$8.50",
+          "price_cents": 850
+        },
+        {
+          "name": "Tiramisu matcha",
+          "price": "$9.50",
+          "price_cents": 950
+        }
+      ]
+    }
+  ]
+}

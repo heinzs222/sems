@@ -47,6 +47,7 @@ from src.agent.language import (
     LangState,
     LanguageCode,
 )
+from src.agent.menu import get_menu_catalog, looks_like_menu_request, find_menu_items
 
 logger = structlog.get_logger(__name__)
 
@@ -153,6 +154,7 @@ class VoicePipeline:
         self._llm: Optional[GroqLLM] = None
         self._router: Optional[SemanticRouter] = None
         self._extraction_queue: Optional[ExtractionQueue] = None
+        self._menu_catalog = None
         
         # State
         self._state = PipelineState.IDLE
@@ -251,6 +253,9 @@ class VoicePipeline:
         # Initialize extraction queue
         self._extraction_queue = ExtractionQueue()
         await self._extraction_queue.start()
+
+        # Warm menu cache (best effort)
+        self._menu_catalog = get_menu_catalog()
         
         # Set up STT callback
         self._stt.set_transcript_callback(self._on_transcript)
@@ -571,6 +576,8 @@ class VoicePipeline:
         first_token_time = None
         full_response = ""
         
+        extra_context = self._build_extra_context(transcript)
+
         # Collect LLM response (keep processing state until we actually speak)
         try:
             self._state = PipelineState.PROCESSING
@@ -578,6 +585,7 @@ class VoicePipeline:
             async for chunk in self._llm.generate_streaming(
                 transcript,
                 target_language=self._lang_state.current,
+                extra_context=extra_context,
             ):
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
                     break
@@ -616,6 +624,61 @@ class VoicePipeline:
             if self._state == PipelineState.SPEAKING:
                 self._state = PipelineState.LISTENING
             self._speech_started_during_tts = False
+
+    def _build_extra_context(self, transcript: str) -> Optional[str]:
+        """
+        Build optional extra system context for the LLM.
+
+        Currently adds menu context when the caller asks about the menu, prices,
+        or mentions a menu item.
+        """
+        catalog = self._menu_catalog or get_menu_catalog()
+        if not catalog:
+            return None
+
+        language = self._lang_state.current
+        wants_menu = looks_like_menu_request(transcript, language=language)
+        matches = find_menu_items(catalog, transcript, limit=10) if not wants_menu else []
+
+        if not wants_menu and not matches:
+            return None
+
+        if language == "fr":
+            header = (
+                "CONTEXTE MENU (source: menu.html)\n"
+                "RÈGLES:\n"
+                "- Utilise uniquement les articles et prix listés ici.\n"
+                "- Si l'appelant veut commander, fais une 'commande brouillon' (simulation) : confirme les articles + quantités, puis demande les détails manquants.\n"
+                "- Ne prétends pas finaliser/payer la commande : indique clairement que c'est une préparation (on ne passe pas la commande pour l'instant).\n"
+                "- Réponses courtes, 1 question à la fois.\n"
+            )
+        else:
+            header = (
+                "MENU CONTEXT (source: menu.html)\n"
+                "RULES:\n"
+                "- Use only the items and prices listed here.\n"
+                "- If the caller wants to order, run a 'draft order' (simulation): confirm items + quantities, then ask for missing details.\n"
+                "- Do not claim you placed/paid for the order yet; clearly say it's a draft for now.\n"
+                "- Keep it short and ask 1 question at a time.\n"
+            )
+
+        if wants_menu:
+            menu_lines = "\n".join(catalog.to_prompt_lines())
+            logger.info("Menu context included", reason="menu_request", current_language=language)
+            return f"{header}\n{menu_lines}"
+
+        # Only provide relevant matches to keep context small.
+        match_lines: List[str] = []
+        for item in matches:
+            match_lines.append(f"- {item.section}: {item.name} — {item.price_text}")
+
+        logger.info(
+            "Menu context included",
+            reason="menu_item_match",
+            current_language=language,
+            num_matches=len(matches),
+        )
+        return f"{header}\nMATCHES:\n" + "\n".join(match_lines)
 
     async def _run_turn(self, queued: QueuedTranscript) -> None:
         """Run a single conversation turn from a final transcript."""

@@ -255,6 +255,7 @@ class GroqLLM:
         user_message: str,
         target_language: Optional[str] = None,
         include_history: bool = True,
+        extra_context: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Generate a streaming response.
@@ -262,6 +263,7 @@ class GroqLLM:
         Args:
             user_message: The user's message
             include_history: Whether to include conversation history
+            extra_context: Optional extra system context (e.g., menu/rules)
             
         Yields:
             Text chunks as they're generated
@@ -270,6 +272,8 @@ class GroqLLM:
 
         # Build messages
         messages = [{"role": "system", "content": system_prompt}]
+        if extra_context:
+            messages.append({"role": "system", "content": extra_context})
         
         if include_history:
             messages.extend(self._history.get_messages())
@@ -315,6 +319,7 @@ class GroqLLM:
         user_message: str,
         target_language: Optional[str] = None,
         include_history: bool = True,
+        extra_context: Optional[str] = None,
     ) -> LLMResponse:
         """
         Generate a complete response (non-streaming).
@@ -322,6 +327,7 @@ class GroqLLM:
         Args:
             user_message: The user's message
             include_history: Whether to include conversation history
+            extra_context: Optional extra system context (e.g., menu/rules)
             
         Returns:
             LLMResponse with full text and timing
@@ -336,6 +342,7 @@ class GroqLLM:
             user_message,
             target_language=target_language,
             include_history=include_history,
+            extra_context=extra_context,
         ):
             if first_token_time is None:
                 first_token_time = time.time()
