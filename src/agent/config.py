@@ -58,6 +58,7 @@ class Config:
     
     # Feature flags
     router_enabled: bool = True
+    menu_only: bool = True
     memory_enabled: bool = False
     outlines_enabled: bool = False
     
@@ -115,6 +116,7 @@ class Config:
             deepgram_language_fr=self.deepgram_language_fr,
             groq_model=self.groq_model,
             router_enabled=self.router_enabled,
+            menu_only=self.menu_only,
             outlines_enabled=self.outlines_enabled,
             agent_name=self.agent_name,
             min_interruption_words=self.min_interruption_words,
@@ -186,6 +188,7 @@ def get_config() -> Config:
         
         # Feature flags
         router_enabled=_get_bool("ROUTER_ENABLED", True),
+        menu_only=_get_bool("MENU_ONLY", True),
         memory_enabled=_get_bool("MEMORY_ENABLED", False),
         outlines_enabled=_get_bool("OUTLINES_ENABLED", False),
         

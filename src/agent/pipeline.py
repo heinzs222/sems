@@ -251,7 +251,7 @@ class VoicePipeline:
         self._llm = get_llm()
         
         # Initialize router if enabled
-        if self.config.router_enabled:
+        if self.config.router_enabled and not self.config.menu_only:
             self._router = get_semantic_router()
             self._router.initialize()
         
@@ -376,9 +376,9 @@ class VoicePipeline:
 
         # Send initial greeting (always).
         greeting = (
-            f"Bonjour ! Je suis {self.config.agent_name} de {self.config.company_name}. Comment puis-je vous aider aujourd'hui ?"
+            f"Bonjour ! Je suis {self.config.agent_name} de {self.config.company_name}. Je peux vous aider avec le menu et prendre votre commande. Qu’est-ce que vous aimeriez ?"
             if self._lang_state.current == "fr"
-            else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. How can I help you today?"
+            else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. I can help with the menu and take your order. What would you like?"
         )
         # Speak greeting in a background task so STT can keep processing.
         if self._output_task and not self._output_task.done():
@@ -599,7 +599,12 @@ class VoicePipeline:
         )
         
         # Try semantic routing first
-        if self._lang_state.current == "en" and self._router and self._router.is_enabled:
+        if (
+            not self.config.menu_only
+            and self._lang_state.current == "en"
+            and self._router
+            and self._router.is_enabled
+        ):
             route_name, audio_chunks, should_hangup = self._router.try_route(transcript)
             
             if route_name and audio_chunks:
@@ -694,16 +699,14 @@ class VoicePipeline:
         wants_menu = looks_like_menu_request(transcript, language=language)
         matches = find_menu_items(catalog, transcript, limit=10) if not wants_menu else []
 
-        if not wants_menu and not matches:
-            return None
-
         if language == "fr":
             header = (
                 "CONTEXTE MENU (source: menu.html)\n"
                 "RÈGLES:\n"
                 "- Utilise uniquement les articles et prix listés ici.\n"
-                "- Si l'appelant veut commander, fais une 'commande brouillon' (simulation) : confirme les articles + quantités, puis demande les détails manquants.\n"
-                "- Ne prétends pas finaliser/payer la commande : indique clairement que c'est une préparation (on ne passe pas la commande pour l'instant).\n"
+                "- Aide l'appelant à choisir et à commander : demande la quantité, confirme ce que tu as noté, puis demande s'il veut autre chose.\n"
+                "- Quand l'appelant dit que c'est tout : récapitule et confirme que la commande est prise et confirmée.\n"
+                "- Ne réponds pas aux questions hors-menu ; redirige vers le menu.\n"
                 "- Réponses courtes, 1 question à la fois.\n"
             )
         else:
@@ -711,10 +714,19 @@ class VoicePipeline:
                 "MENU CONTEXT (source: menu.html)\n"
                 "RULES:\n"
                 "- Use only the items and prices listed here.\n"
-                "- If the caller wants to order, run a 'draft order' (simulation): confirm items + quantities, then ask for missing details.\n"
-                "- Do not claim you placed/paid for the order yet; clearly say it's a draft for now.\n"
+                "- Help the caller choose and place a (simulated) order: ask quantity, confirm what you recorded, then ask if they want anything else.\n"
+                "- When the caller says they're done: summarize and confirm the order is taken and confirmed.\n"
+                "- Do not answer non-menu questions; redirect back to the menu.\n"
                 "- Keep it short and ask 1 question at a time.\n"
             )
+
+        if self.config.menu_only:
+            menu_lines = "\n".join(catalog.to_prompt_lines())
+            logger.info("Menu context included", reason="menu_only", current_language=language)
+            return f"{header}\n{menu_lines}"
+
+        if not wants_menu and not matches:
+            return None
 
         if wants_menu:
             menu_lines = "\n".join(catalog.to_prompt_lines())

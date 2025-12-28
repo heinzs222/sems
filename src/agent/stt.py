@@ -3,8 +3,8 @@ Deepgram Speech-to-Text streaming client.
 
 Late-2025 Best Practice:
 - Accepts mu-law 8kHz directly from Twilio (no conversion needed!)
-- Supports both v1 (nova-2) and v2 (Flux) endpoints
-- Flux mode uses ~80ms chunks for better turn detection
+- Uses Deepgram Nova-3 with automatic language detection
+- Prefers v2 (/v2/listen, Flux) and falls back to v1 (/v1/listen) when needed
 
 This eliminates CPU-heavy resampling that causes choppy audio.
 """
@@ -27,7 +27,7 @@ logger = structlog.get_logger(__name__)
 DEEPGRAM_V1_URL = "wss://api.deepgram.com/v1/listen"
 DEEPGRAM_V2_URL = "wss://api.deepgram.com/v2/listen"  # Flux endpoint
 
-# Prefer Deepgram v2 (/v2/listen). If it fails, we fall back automatically.
+# Prefer Deepgram v2 (/v2/listen). If it fails, we fall back to v1.
 # You can force v1 only with USE_DEEPGRAM_V1_ONLY=true.
 USE_DEEPGRAM_V1_ONLY = os.getenv("USE_DEEPGRAM_V1_ONLY", "false").lower() == "true"
 
@@ -116,52 +116,43 @@ class DeepgramSTT:
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}
 
             # Prefer v2 for modern features like language detection; fall back for compatibility.
-            # Also try multiple models because availability can vary by account.
+            #
+            # NOTE: We intentionally use Nova-3 only (latest) and do not fall back to older models.
             candidates: list[tuple[str, str]] = []
-            for model in ("nova-3", "nova-2"):
-                common = (
-                    f"?model={model}"
-                    f"&encoding=mulaw"
-                    f"&sample_rate=8000"
-                    f"&channels=1"
-                    f"&punctuate=true"
-                    f"&interim_results=true"
-                    f"&smart_format=true"
-                )
+            model = "nova-3"
+            common = (
+                f"?model={model}"
+                f"&encoding=mulaw"
+                f"&sample_rate=8000"
+                f"&channels=1"
+                f"&punctuate=true"
+                f"&interim_results=true"
+                f"&smart_format=true"
+            )
 
-                if not USE_DEEPGRAM_V1_ONLY:
-                    candidates.append(
-                        (
-                            f"v2_detect_language_{model}",
-                            DEEPGRAM_V2_URL
-                            + common
-                            + "&vad_events=true"
-                            + "&detect_language=true",
-                        )
-                    )
-
+            # Candidate 1: v2 + detect_language
+            if not USE_DEEPGRAM_V1_ONLY:
                 candidates.append(
                     (
-                        f"v1_detect_language_{model}",
-                        DEEPGRAM_V1_URL
+                        "v2_detect_language_nova-3",
+                        DEEPGRAM_V2_URL
                         + common
                         + "&vad_events=true"
-                        + "&endpointing=300"
                         + "&detect_language=true",
                     )
                 )
 
-                # Last-resort fallback: pin language so the agent can still respond.
-                candidates.append(
-                    (
-                        f"v1_pinned_language_{model}",
-                        DEEPGRAM_V1_URL
-                        + common
-                        + "&vad_events=true"
-                        + "&endpointing=300"
-                        + f"&language={self.language}",
-                    )
+            # Candidate 2: v1 + detect_language (fallback)
+            candidates.append(
+                (
+                    "v1_detect_language_nova-3",
+                    DEEPGRAM_V1_URL
+                    + common
+                    + "&vad_events=true"
+                    + "&endpointing=300"
+                    + "&detect_language=true",
                 )
+            )
 
             last_error: Optional[BaseException] = None
             for label, url in candidates:
