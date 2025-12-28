@@ -38,6 +38,8 @@ class TranscriptionResult:
     is_final: bool
     confidence: float = 0.0
     speech_final: bool = False
+    detected_language: Optional[str] = None
+    language_confidence: Optional[float] = None
     timestamp: float = field(default_factory=time.time)
     latency_ms: float = 0.0
 
@@ -87,6 +89,8 @@ class DeepgramSTT:
         self._current_transcript = ""
         self._word_count = 0
         self._receive_task = None
+        self._detected_language: Optional[str] = None
+        self._language_confidence: Optional[float] = None
     
     @property
     def is_connected(self) -> bool:
@@ -112,7 +116,6 @@ class DeepgramSTT:
                 # Flux mode: better turn detection, ~80ms chunks recommended
                 params = (
                     f"?model=nova-2"
-                    f"&language={self.language}"
                     f"&encoding=mulaw"  # Direct mu-law - no conversion!
                     f"&sample_rate=8000"  # Twilio's native rate
                     f"&channels=1"
@@ -121,6 +124,7 @@ class DeepgramSTT:
                     f"&vad_events=true"
                     f"&speech_started=true"
                     f"&smart_format=true"
+                    f"&detect_language=true"
                 )
                 url = DEEPGRAM_V2_URL + params
                 logger.info("Using Deepgram Flux mode (v2)")
@@ -128,7 +132,6 @@ class DeepgramSTT:
                 # Standard mode with mu-law 8kHz - simplified params
                 params = (
                     f"?model=nova-3"
-                    f"&language={self.language}"
                     f"&encoding=mulaw"
                     f"&sample_rate=8000"
                     f"&channels=1"
@@ -138,6 +141,7 @@ class DeepgramSTT:
                     f"&speech_started=true"
                     f"&smart_format=true"
                     f"&endpointing=300"
+                    f"&detect_language=true"
                 )
                 url = DEEPGRAM_V1_URL + params
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}
@@ -215,6 +219,8 @@ class DeepgramSTT:
         """Handle a message from Deepgram."""
         msg_type = data.get("type", "")
         msg_type_norm = msg_type.lower() if isinstance(msg_type, str) else ""
+
+        self._maybe_update_language_detection(data)
         
         if msg_type == "Results":
             channel = data.get("channel", {})
@@ -248,6 +254,8 @@ class DeepgramSTT:
                 is_final=is_final,
                 confidence=confidence,
                 speech_final=speech_final,
+                detected_language=self._detected_language,
+                language_confidence=self._language_confidence,
                 latency_ms=latency_ms,
             )
             
@@ -273,6 +281,8 @@ class DeepgramSTT:
                     text=self._current_transcript,
                     is_final=True,
                     speech_final=True,
+                    detected_language=self._detected_language,
+                    language_confidence=self._language_confidence,
                 )
                 await self._on_transcript(result)
             self._current_transcript = ""
@@ -285,6 +295,49 @@ class DeepgramSTT:
         """Reset transcript state."""
         self._current_transcript = ""
         self._word_count = 0
+
+    def _maybe_update_language_detection(self, data: dict) -> None:
+        detected, confidence = self._extract_language_detection(data)
+        if detected:
+            self._detected_language = detected
+        if confidence is not None:
+            self._language_confidence = confidence
+
+    @staticmethod
+    def _extract_language_detection(data: dict) -> tuple[Optional[str], Optional[float]]:
+        """
+        Best-effort extraction of Deepgram language detection fields.
+
+        Deepgram may provide these at top-level, under `metadata`, or under `channel`
+        depending on model/endpoint.
+        """
+        detected = None
+        confidence = None
+
+        candidates: list[dict] = [data]
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata)
+        channel = data.get("channel")
+        if isinstance(channel, dict):
+            candidates.append(channel)
+
+        for c in candidates:
+            if detected is None:
+                value = c.get("detected_language")
+                if isinstance(value, str) and value.strip():
+                    detected = value.strip()
+            if confidence is None:
+                value = c.get("language_confidence")
+                if isinstance(value, (int, float)):
+                    confidence = float(value)
+                elif isinstance(value, str):
+                    try:
+                        confidence = float(value)
+                    except ValueError:
+                        pass
+
+        return detected, confidence
 
 
 class STTManager:

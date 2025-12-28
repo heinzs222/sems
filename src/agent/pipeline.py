@@ -41,7 +41,12 @@ from src.agent.tts import TTSManager, TTSChunk
 from src.agent.llm import GroqLLM, get_llm
 from src.agent.routing import get_semantic_router, SemanticRouter
 from src.agent.extract import ExtractionQueue
-from src.agent.language import detect_language_switch_command, LanguageCode
+from src.agent.language import (
+    detect_language_override,
+    detect_language_switch_command,
+    LangState,
+    LanguageCode,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -109,6 +114,8 @@ class QueuedTranscript:
     """A final transcript queued for turn processing."""
     text: str
     stt_latency_ms: float = 0.0
+    detected_language: Optional[str] = None
+    language_confidence: Optional[float] = None
 
 
 class VoicePipeline:
@@ -135,7 +142,9 @@ class VoicePipeline:
         
         self.config = config
         self._send_message = send_message
-        self._language: LanguageCode = "fr" if self.config.default_language.startswith("fr") else "en"
+        self._lang_state = LangState(
+            current="fr" if self.config.default_language.startswith("fr") else "en"
+        )
         
         # Components
         self._protocol = TwilioProtocolHandler()
@@ -179,47 +188,37 @@ class VoicePipeline:
         # Twilio client for hangup
         self._twilio_client: Optional[TwilioClient] = None
     
-    def _current_deepgram_language(self) -> str:
-        return self.config.deepgram_language_fr if self._language == "fr" else self.config.deepgram_language_en
-    
     def _current_cartesia_voice_id(self) -> str:
-        if self._language == "fr":
+        if self._lang_state.current == "fr":
             return self.config.cartesia_voice_id_fr or self.config.cartesia_voice_id
         return self.config.cartesia_voice_id
     
-    async def _switch_language(self, target: LanguageCode, user_transcript: str) -> None:
-        """Switch per-call language mode (STT + TTS + LLM)."""
-        if target == self._language:
+    async def _apply_language_override(self, target: LanguageCode) -> None:
+        """Apply an explicit user override and confirm once."""
+        if target == self._lang_state.current:
             return
         
-        previous = self._language
-        self._language = target
-        
-        # Try to swap STT language without dropping the existing connection on failure.
-        deepgram_language = self._current_deepgram_language()
-        stt_ok = await self._stt.restart(language=deepgram_language)
-        if not stt_ok:
-            logger.warning(
-                "Failed to switch STT language",
-                previous_language=previous,
-                target_language=target,
-                deepgram_language=deepgram_language,
-            )
-        
-        # Keep LLM history consistent even when we handle the switch deterministically.
-        if self._llm:
-            self._llm.history.add_user_message(user_transcript)
+        previous = self._lang_state.current
+        now = time.time()
+        self._lang_state.force(target, now)
         
         confirmation = (
-            f"D'accord. Je peux parler français maintenant. Comment puis-je vous aider ?"
+            "D’accord, je continue en français."
             if target == "fr"
-            else f"Got it. I'll speak English now. How can I help?"
+            else "Sure—switching to English."
         )
-        
+
+        logger.info(
+            "Language decision",
+            detected_language=None,
+            language_confidence=None,
+            current_language=self._lang_state.current,
+            switched=True,
+            reason="override",
+            previous_language=previous,
+        )
+
         await self._speak_response(confirmation)
-        
-        if self._llm:
-            self._llm.history.add_assistant_message(confirmation)
     
     @property
     def state(self) -> PipelineState:
@@ -347,7 +346,7 @@ class VoicePipeline:
         self._call_metrics.stream_sid = event.stream_sid
         
         # Start STT
-        if await self._stt.start(language=self._current_deepgram_language()):
+        if await self._stt.start():
             self._state = PipelineState.LISTENING
             logger.info(
                 "Call started, listening",
@@ -358,7 +357,7 @@ class VoicePipeline:
             # Send initial greeting
             greeting = (
                 f"Bonjour ! Je suis {self.config.agent_name} de {self.config.company_name}. Comment puis-je vous aider aujourd'hui ?"
-                if self._language == "fr"
+                if self._lang_state.current == "fr"
                 else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. How can I help you today?"
             )
             # Speak greeting in a background task so STT can keep processing.
@@ -440,7 +439,14 @@ class VoicePipeline:
                 self._pending_transcript = ""
             
             logger.info("Final transcript", text=transcript[:100])
-            await self._turn_queue.put(QueuedTranscript(text=transcript, stt_latency_ms=result.latency_ms))
+            await self._turn_queue.put(
+                QueuedTranscript(
+                    text=transcript,
+                    stt_latency_ms=result.latency_ms,
+                    detected_language=result.detected_language,
+                    language_confidence=result.language_confidence,
+                )
+            )
     
     async def _handle_interruption(self) -> None:
         """Handle user interruption during TTS playback."""
@@ -493,7 +499,13 @@ class VoicePipeline:
         
         self._state = PipelineState.LISTENING
     
-    async def _process_transcript(self, transcript: str) -> None:
+    async def _process_transcript(
+        self,
+        transcript: str,
+        *,
+        detected_language: Optional[str] = None,
+        language_confidence: Optional[float] = None,
+    ) -> None:
         """
         Process a final transcript.
         
@@ -501,14 +513,34 @@ class VoicePipeline:
         """
         self._state = PipelineState.PROCESSING
         
-        # Handle explicit language switch requests (do not route/LLM these).
-        target_language = detect_language_switch_command(transcript)
-        if target_language and target_language != self._language:
-            await self._switch_language(target_language, transcript)
+        # Explicit override phrases always win (do not route/LLM these).
+        override_language = detect_language_override(transcript) or detect_language_switch_command(transcript)
+        if override_language and override_language != self._lang_state.current:
+            await self._apply_language_override(override_language)
             return
+
+        # Stabilized auto-switch using Deepgram's language detection.
+        previous_language = self._lang_state.current
+        now = time.time()
+        switched, reason = self._lang_state.update_from_detection(
+            text=transcript,
+            detected_language=detected_language,
+            language_confidence=language_confidence,
+            now=now,
+        )
+
+        logger.info(
+            "Language decision",
+            detected_language=detected_language,
+            language_confidence=language_confidence,
+            current_language=self._lang_state.current,
+            switched=switched,
+            reason=reason or None,
+            previous_language=previous_language,
+        )
         
         # Try semantic routing first
-        if self._language == "en" and self._router and self._router.is_enabled:
+        if self._lang_state.current == "en" and self._router and self._router.is_enabled:
             route_name, audio_chunks, should_hangup = self._router.try_route(transcript)
             
             if route_name and audio_chunks:
@@ -543,7 +575,10 @@ class VoicePipeline:
         try:
             self._state = PipelineState.PROCESSING
             
-            async for chunk in self._llm.generate_streaming(transcript, language=self._language):
+            async for chunk in self._llm.generate_streaming(
+                transcript,
+                target_language=self._lang_state.current,
+            ):
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
                     break
                 
@@ -589,7 +624,11 @@ class VoicePipeline:
             self._current_turn_metrics.stt_ms = queued.stt_latency_ms
         
         try:
-            await self._process_transcript(queued.text)
+            await self._process_transcript(
+                queued.text,
+                detected_language=queued.detected_language,
+                language_confidence=queued.language_confidence,
+            )
         except asyncio.CancelledError:
             logger.debug("Turn cancelled")
         except Exception as e:
@@ -863,7 +902,7 @@ class VoicePipeline:
                     logger.debug("Extended silence detected")
                     prompt = (
                         "Vous êtes toujours là ? Est-ce que je peux vous aider avec autre chose ?"
-                        if self._language == "fr"
+                        if self._lang_state.current == "fr"
                         else "Are you still there? Is there anything else I can help you with?"
                     )
                     await self._speak_response(prompt)

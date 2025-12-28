@@ -80,7 +80,7 @@ class ConversationHistory:
         return len(self._turns)
 
 
-def get_system_prompt(config: Optional[Any] = None, language: str = "en") -> str:
+def get_system_prompt(config: Optional[Any] = None, target_language: str = "en") -> str:
     """
     Get the system prompt for the voice agent.
     
@@ -89,15 +89,19 @@ def get_system_prompt(config: Optional[Any] = None, language: str = "en") -> str
     if config is None:
         config = get_config()
     
-    language_norm = (language or "en").strip().lower()
+    language_norm = (target_language or "en").strip().lower()
     is_french = language_norm.startswith("fr")
+    target_label = "French" if is_french else "English"
 
     if is_french:
         return f"""Tu es {config.agent_name}, une assistante téléphonique sympathique et professionnelle pour {config.company_name}.
 
-LANGUE:
-- Réponds en français.
-- Si l'appelant demande explicitement de passer à l'anglais, réponds en anglais.
+TARGET_LANGUAGE: {target_label}
+
+RÈGLES DE LANGUE (OBLIGATOIRES):
+- Réponds uniquement en TARGET_LANGUAGE.
+- Même si l'appelant parle une autre langue, réponds quand même uniquement en TARGET_LANGUAGE.
+- Ne change jamais de langue de toi-même ; seul le système peut mettre à jour TARGET_LANGUAGE.
 
 COMPORTEMENT:
 - Sois naturelle et conversationnelle (appel téléphonique).
@@ -114,6 +118,13 @@ STYLE:
 - Évite les listes longues et les explications trop techniques."""
 
     return f"""You are {config.agent_name}, a friendly and helpful AI phone assistant for {config.company_name}.
+
+TARGET_LANGUAGE: {target_label}
+
+LANGUAGE RULES (MANDATORY):
+- Reply only in TARGET_LANGUAGE.
+- Even if the caller speaks another language, still reply only in TARGET_LANGUAGE.
+- Never switch languages on your own; only the system can change TARGET_LANGUAGE.
 
 CORE BEHAVIORS:
 - Be conversational and natural - you're on a phone call
@@ -242,7 +253,7 @@ class GroqLLM:
     async def generate_streaming(
         self,
         user_message: str,
-        language: Optional[str] = None,
+        target_language: Optional[str] = None,
         include_history: bool = True,
     ) -> AsyncGenerator[str, None]:
         """
@@ -255,7 +266,7 @@ class GroqLLM:
         Yields:
             Text chunks as they're generated
         """
-        system_prompt = get_system_prompt(self.config, language=language or "en")
+        system_prompt = get_system_prompt(self.config, target_language=target_language or "en")
 
         # Build messages
         messages = [{"role": "system", "content": system_prompt}]
@@ -290,7 +301,7 @@ class GroqLLM:
             
         except Exception as e:
             logger.error("LLM generation failed", error=str(e))
-            language_norm = (language or "en").strip().lower()
+            language_norm = (target_language or "en").strip().lower()
             error_msg = (
                 "Désolé, j'ai un problème technique en ce moment. Pouvez-vous répéter ?"
                 if language_norm.startswith("fr")
@@ -302,7 +313,7 @@ class GroqLLM:
     async def generate(
         self,
         user_message: str,
-        language: Optional[str] = None,
+        target_language: Optional[str] = None,
         include_history: bool = True,
     ) -> LLMResponse:
         """
@@ -321,7 +332,11 @@ class GroqLLM:
         full_text = ""
         token_count = 0
         
-        async for chunk in self.generate_streaming(user_message, language=language, include_history=include_history):
+        async for chunk in self.generate_streaming(
+            user_message,
+            target_language=target_language,
+            include_history=include_history,
+        ):
             if first_token_time is None:
                 first_token_time = time.time()
             full_text += chunk
