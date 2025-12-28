@@ -71,6 +71,7 @@ class CheckoutPhase(str, Enum):
     ORDERING = "ordering"
     NAME = "name"
     NAME_CONFIRM = "name_confirm"
+    NAME_SPELL = "name_spell"
     ADDRESS = "address"
     ADDRESS_CONFIRM = "address_confirm"
     PHONE = "phone"
@@ -92,60 +93,60 @@ def _normalize_for_intent(text: str) -> str:
 _YES_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"(^|\\b)(yes|yeah|yep|correct|thats right|that's right|right|ok|okay|sure)(\\b|$)",
-        r"(^|\\b)(oui|ouais|d'accord|daccord|exact|c'est ca|cest ca)(\\b|$)",
+        r"(^|\b)(yes|yeah|yep|correct|thats right|that's right|right|ok|okay|sure)(\b|$)",
+        r"(^|\b)(oui|ouais|d'accord|daccord|exact|c'est ca|cest ca)(\b|$)",
     )
 )
 
 _NO_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"(^|\\b)(no|nope|nah|wrong|not correct)(\\b|$)",
-        r"(^|\\b)(non|pas du tout|c'est pas ca|cest pas ca)(\\b|$)",
+        r"(^|\b)(no|nope|nah|wrong|not correct)(\b|$)",
+        r"(^|\b)(non|pas du tout|c'est pas ca|cest pas ca)(\b|$)",
     )
 )
 
 _DONE_ORDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"\\b(thats all|that's all|thats it|that's it|nothing else|im done|i'm done|done)(\\b|$)",
-        r"\\b(c'est tout|cest tout|rien d'autre|j'ai fini|jai fini|c'est bon|cest bon)(\\b|$)",
+        r"\b(thats all|that's all|thats it|that's it|nothing else|im done|i'm done|done)(\b|$)",
+        r"\b(c'est tout|cest tout|rien d'autre|j'ai fini|jai fini|c'est bon|cest bon)(\b|$)",
     )
 )
 
 _MODIFY_ORDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"\\b(add|actually|instead|change|wait|hold on)(\\b|$)",
-        r"\\b(ajoute|ajouter|finalement|au fait|changer|attends)(\\b|$)",
+        r"\b(add|actually|instead|change|wait|hold on)(\b|$)",
+        r"\b(ajoute|ajouter|finalement|au fait|changer|attends)(\b|$)",
     )
 )
 
 _GOODBYE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"\\b(bye|goodbye|hang up|end call)(\\b|$)",
-        r"\\b(au revoir|bye bye|raccroche|raccrocher)(\\b|$)",
+        r"\b(bye|goodbye|hang up|end call)(\b|$)",
+        r"\b(au revoir|bye bye|raccroche|raccrocher)(\b|$)",
     )
 )
 
 _HANGUP_NOW_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
-        r"\\b(hang up|end call)(\\b|$)",
-        r"\\b(raccroche|raccrocher)(\\b|$)",
+        r"\b(hang up|end call)(\b|$)",
+        r"\b(raccroche|raccrocher)(\b|$)",
     )
 )
 
-_CA_POSTAL_RE = re.compile(r"\\b([a-z]\\d[a-z])\\s?(\\d[a-z]\\d)\\b", re.IGNORECASE)
-_EMAIL_RE = re.compile(r"\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b", re.IGNORECASE)
+_CA_POSTAL_RE = re.compile(r"\b([a-z]\d[a-z])\s?(\d[a-z]\d)\b", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
 _BARGE_IN_BACKCHANNEL_RE = re.compile(
     r"^(ok|okay|yeah|yep|yup|uh huh|uh-huh|mhm|mm hmm|mm-hmm|oui|ouais|d['’]accord|daccord)([.!?])?$"
 )
 
 _BARGE_IN_HARD_PHRASE_RE = re.compile(
-    r"\\b(stop|wait|hold on|one second|pause|cancel|actually|listen|arrete|attends|un instant|annule|ecoute)\\b"
+    r"\b(stop|wait|hold on|one second|pause|cancel|actually|listen|arrete|attends|un instant|annule|ecoute)\b"
 )
 
 _BARGE_IN_RMS_THRESHOLD = 500
@@ -460,6 +461,51 @@ class VoicePipeline:
     def _wants_goodbye(self, text: str) -> bool:
         return self._matches_any(_GOODBYE_PATTERNS, text)
 
+    def _maybe_sync_checkout_phase_from_assistant(self, assistant_text: str) -> None:
+        """
+        If the LLM asks for checkout info (name/address/phone/email), sync our deterministic
+        checkout state so the next caller utterance is handled without calling the LLM again.
+        """
+        if not self.config.menu_only:
+            return
+        if self._checkout_phase != CheckoutPhase.ORDERING:
+            return
+
+        normalized = _normalize_for_intent(assistant_text)
+        if not normalized:
+            return
+
+        # English patterns
+        if re.search(
+            r"\b(what(?:'s| is) your name|your (?:full )?name|name should i put|put it under)\b",
+            normalized,
+        ):
+            self._checkout_phase = CheckoutPhase.NAME
+            return
+        if re.search(r"\b(what(?:'s| is) your address|your address|delivery address)\b", normalized):
+            self._checkout_phase = CheckoutPhase.ADDRESS
+            return
+        if re.search(r"\b(phone number|your phone|telephone number)\b", normalized):
+            self._checkout_phase = CheckoutPhase.PHONE
+            return
+        if re.search(r"\b(email address|your email|e-mail address)\b", normalized):
+            self._checkout_phase = CheckoutPhase.EMAIL
+            return
+
+        # French patterns (normalized is accent-stripped)
+        if re.search(r"\b(quel est votre nom|votre nom)\b", normalized):
+            self._checkout_phase = CheckoutPhase.NAME
+            return
+        if re.search(r"\b(votre adresse|adresse de livraison)\b", normalized):
+            self._checkout_phase = CheckoutPhase.ADDRESS
+            return
+        if re.search(r"\b(numero de telephone|telephone|votre telephone)\b", normalized):
+            self._checkout_phase = CheckoutPhase.PHONE
+            return
+        if re.search(r"\b(votre email|adresse email|courriel|votre courriel)\b", normalized):
+            self._checkout_phase = CheckoutPhase.EMAIL
+            return
+
     def _extract_name(self, text: str) -> str:
         t = (text or "").strip()
         if not t:
@@ -467,8 +513,8 @@ class VoicePipeline:
 
         normalized = _normalize_for_intent(t)
         patterns = (
-            r"^(my name is|this is|it's|it is)\\s+",
-            r"^(je m'appelle|mon nom est|c'est)\\s+",
+            r"^(my name is|this is|it's|it is)\s+",
+            r"^(je m'appelle|mon nom est|c'est)\s+",
         )
         for pat in patterns:
             normalized = re.sub(pat, "", normalized, flags=re.IGNORECASE)
@@ -476,18 +522,80 @@ class VoicePipeline:
         # Prefer the original casing when possible by removing common prefixes again.
         original = t
         original = re.sub(
-            r"^(my name is|this is|it's|it is)\\s+",
+            r"^(my name is|this is|it's|it is)\s+",
             "",
             original,
             flags=re.IGNORECASE,
         ).strip()
         original = re.sub(
-            r"^(je m'appelle|mon nom est|c'est)\\s+",
+            r"^(je m'appelle|mon nom est|c'est)\s+",
             "",
             original,
             flags=re.IGNORECASE,
         ).strip()
         return original if original else normalized
+
+    def _extract_spelled_name(self, text: str) -> str:
+        """
+        Extract a name when the caller spells it letter-by-letter.
+
+        Supports formats like:
+        - "J O H N space D O E"
+        - "J, O, H, N, espace, D, O, E"
+        - "J O H N DOE" (mixed spelled + word)
+        """
+        t = (text or "").strip()
+        if not t:
+            return ""
+
+        normalized = _normalize_for_intent(t)
+        normalized = re.sub(
+            r"^(my name is|this is|it's|it is)\s+",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            r"^(je m'appelle|mon nom est|c'est)\s+",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+        normalized = re.sub(r"\b(space|espace)\b", " | ", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"[^a-z0-9|]+", " ", normalized)
+        tokens = [tok for tok in normalized.split() if tok]
+
+        words: List[str] = []
+        current_letters: List[str] = []
+
+        for tok in tokens:
+            if tok == "|":
+                if current_letters:
+                    words.append("".join(current_letters))
+                    current_letters = []
+                continue
+
+            if len(tok) == 1 and tok.isalnum():
+                current_letters.append(tok)
+                continue
+
+            # If the caller says a full chunk (e.g., "DOE"), treat it as a word.
+            if tok.isalpha() and len(tok) > 1:
+                if current_letters:
+                    words.append("".join(current_letters))
+                    current_letters = []
+                words.append(tok)
+                continue
+
+        if current_letters:
+            words.append("".join(current_letters))
+
+        words = [w for w in words if w]
+        if not words:
+            return ""
+
+        return " ".join(w.capitalize() for w in words).strip()
 
     def _extract_address(self, text: str) -> str:
         t = (text or "").strip()
@@ -495,13 +603,13 @@ class VoicePipeline:
             return ""
         original = t
         original = re.sub(
-            r"^(my address is|address is|it's|it is)\\s+",
+            r"^(my address is|address is|it's|it is)\s+",
             "",
             original,
             flags=re.IGNORECASE,
         ).strip()
         original = re.sub(
-            r"^(mon adresse est|l'adresse est|adresse|c'est)\\s+",
+            r"^(mon adresse est|l'adresse est|adresse|c'est)\s+",
             "",
             original,
             flags=re.IGNORECASE,
@@ -515,13 +623,13 @@ class VoicePipeline:
 
         original = t
         original = re.sub(
-            r"^(my phone is|my number is|phone number is|phone is|number is)\\s+",
+            r"^(my phone is|my number is|phone number is|phone is|number is)\s+",
             "",
             original,
             flags=re.IGNORECASE,
         ).strip()
         original = re.sub(
-            r"^(mon numero est|mon num\\S+ro est|numero|num\\S+ro|telephone|t\\S+l\\S+phone)\\s+",
+            r"^(mon numero est|mon num\S+ro est|numero|num\S+ro|telephone|t\S+l\S+phone)\s+",
             "",
             original,
             flags=re.IGNORECASE,
@@ -585,7 +693,7 @@ class VoicePipeline:
         return spelled or None
 
     def _spell_first_number(self, text: str) -> Optional[str]:
-        match = re.search(r"\\b(\\d{1,6})\\b", text or "")
+        match = re.search(r"\b(\d{1,6})\b", text or "")
         if not match:
             return None
         digits = match.group(1)
@@ -631,13 +739,13 @@ class VoicePipeline:
 
             mentioned_name = bool(
                 re.match(
-                    r"^(my name is|this is|it's|it is)\\b|^(je m'appelle|mon nom est|c'est)\\b",
+                    r"^(my name is|this is|it's|it is)\b|^(je m'appelle|mon nom est|c'est)\b",
                     normalized,
                 )
             )
             mentioned_address = bool(
                 _CA_POSTAL_RE.search(transcript)
-                or re.search(r"\\b(address|adresse)\\b", normalized)
+                or re.search(r"\b(address|adresse)\b", normalized)
             )
 
             phone = self._extract_phone(transcript)
@@ -682,11 +790,10 @@ class VoicePipeline:
                 return True
 
             self._checkout_phase = CheckoutPhase.NAME_CONFIRM
-            spelled = self._spell_alnum(self._customer_name)
             confirm = (
-                f"Super ! J'ai noté {self._customer_name}. Je l'épelle: {spelled}. C'est bien ça ?"
+                f"Super ! J'ai noté {self._customer_name}. C'est bien ça ?"
                 if language == "fr"
-                else f"Awesome! I got {self._customer_name}. That's {spelled}. Did I spell that right?"
+                else f"Perfect—your name is {self._customer_name}, right?"
             )
             await self._speak_response(confirm)
             return True
@@ -703,11 +810,10 @@ class VoicePipeline:
                 return True
 
             self._customer_name = name
-            spelled = self._spell_alnum(name)
             confirm = (
-                f"Super ! J’ai noté {name}. Je l’épelle: {spelled}. C’est bien ça ?"
+                f"Super ! J'ai noté {name}. C'est bien ça ?"
                 if language == "fr"
-                else f"Awesome! I got {name}. That’s {spelled}. Did I spell that right?"
+                else f"Perfect—your name is {name}, right?"
             )
             self._checkout_phase = CheckoutPhase.NAME_CONFIRM
             await self._speak_response(confirm)
@@ -761,28 +867,58 @@ class VoicePipeline:
                 return True
 
             if self._is_negative(transcript):
-                self._checkout_phase = CheckoutPhase.NAME
+                self._checkout_phase = CheckoutPhase.NAME_SPELL
                 ask = (
-                    "Oups, d’accord. Pouvez-vous répéter votre nom lentement ?"
+                    "Pas de souci. Pouvez-vous l'épeler lettre par lettre, et dire « espace » entre le prénom et le nom ?"
                     if language == "fr"
-                    else "Oops—okay. Can you repeat your name slowly?"
+                    else "No problem. Please spell it letter by letter, and say “space” between your first and last name."
                 )
                 await self._speak_response(ask)
                 return True
 
             reprompt = (
-                "Juste pour confirmer: est-ce que l’orthographe est correcte ? Oui ou non ?"
+                "Juste pour confirmer: est-ce que j'ai bien votre nom ? Oui ou non ?"
                 if language == "fr"
-                else "Quick check—did I spell your name correctly? Yes or no?"
+                else "Quick check—did I get your name right? Yes or no?"
             )
             await self._speak_response(reprompt)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.NAME_SPELL:
+            spelled_name = self._extract_spelled_name(transcript)
+            if not spelled_name:
+                retry = (
+                    "D'accord. Épelez-le lettre par lettre, comme: J, O, H, N, espace, D, O, E."
+                    if language == "fr"
+                    else "Okay. Spell it letter by letter, like: J, O, H, N, space, D, O, E."
+                )
+                await self._speak_response(retry)
+                return True
+
+            self._customer_name = spelled_name
+            parts = [p for p in re.split(r"\s+", spelled_name.strip()) if p]
+            spelled_parts = [self._spell_alnum(p) for p in parts]
+            separator = "ESPACE" if language == "fr" else "SPACE"
+            spelled = (
+                f", {separator}, ".join(spelled_parts)
+                if spelled_parts
+                else self._spell_alnum(spelled_name)
+            )
+
+            confirm = (
+                f"Merci ! Je l'ai: {spelled}. Donc {spelled_name}. C'est bien ça ?"
+                if language == "fr"
+                else f"Got it: {spelled}. That's {spelled_name}. Is that correct?"
+            )
+            self._checkout_phase = CheckoutPhase.NAME_CONFIRM
+            await self._speak_response(confirm)
             return True
 
         if self._checkout_phase == CheckoutPhase.ADDRESS:
             address = self._extract_address(transcript)
             if not address:
                 retry = (
-                    "Désolé, je n’ai pas compris l’adresse. Pouvez-vous la répéter ?"
+                    "Désolé, je n'ai pas compris l'adresse. Pouvez-vous la répéter ?"
                     if language == "fr"
                     else "Sorry—I didn’t catch the address. Can you repeat it?"
                 )
@@ -1586,8 +1722,9 @@ class VoicePipeline:
             
             # Speak the response if not interrupted
             if self._state != PipelineState.INTERRUPTED and full_response:
+                self._maybe_sync_checkout_phase_from_assistant(full_response)
                 await self._speak_response(full_response)
-                
+                 
                 # Submit for extraction (background, non-blocking)
                 if self._extraction_queue:
                     await self._extraction_queue.submit(
