@@ -27,8 +27,9 @@ logger = structlog.get_logger(__name__)
 DEEPGRAM_V1_URL = "wss://api.deepgram.com/v1/listen"
 DEEPGRAM_V2_URL = "wss://api.deepgram.com/v2/listen"  # Flux endpoint
 
-# Feature flag for Flux mode
-USE_DEEPGRAM_FLUX = os.getenv("USE_DEEPGRAM_FLUX", "false").lower() == "true"
+# Prefer Deepgram v2 (/v2/listen). If it fails, we fall back automatically.
+# You can force v1 only with USE_DEEPGRAM_V1_ONLY=true.
+USE_DEEPGRAM_V1_ONLY = os.getenv("USE_DEEPGRAM_V1_ONLY", "false").lower() == "true"
 
 
 @dataclass
@@ -112,49 +113,91 @@ class DeepgramSTT:
         try:
             # Late-2025 best practice: Send mu-law 8kHz directly to Deepgram
             # No conversion needed - Deepgram accepts mulaw encoding natively!
-            if USE_DEEPGRAM_FLUX:
-                # Flux mode: better turn detection, ~80ms chunks recommended
-                params = (
-                    f"?model=nova-2"
-                    f"&encoding=mulaw"  # Direct mu-law - no conversion!
-                    f"&sample_rate=8000"  # Twilio's native rate
-                    f"&channels=1"
-                    f"&punctuate=true"
-                    f"&interim_results=true"
-                    f"&vad_events=true"
-                    f"&smart_format=true"
-                    f"&detect_language=true"
-                )
-                url = DEEPGRAM_V2_URL + params
-                logger.info("Using Deepgram Flux mode (v2)")
-            else:
-                # Standard mode with mu-law 8kHz - simplified params
-                params = (
-                    f"?model=nova-3"
-                    f"&encoding=mulaw"
-                    f"&sample_rate=8000"
-                    f"&channels=1"
-                    f"&punctuate=true"
-                    f"&interim_results=true"
-                    f"&vad_events=true"
-                    f"&smart_format=true"
-                    f"&endpointing=300"
-                    f"&detect_language=true"
-                )
-                url = DEEPGRAM_V1_URL + params
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}
-            
-            self._ws = await websockets.connect(url, additional_headers=headers)
+
+            common = (
+                f"?model=nova-3"
+                f"&encoding=mulaw"
+                f"&sample_rate=8000"
+                f"&channels=1"
+                f"&punctuate=true"
+                f"&interim_results=true"
+                f"&smart_format=true"
+            )
+
+            # Prefer v2 for modern features like language detection; fall back for compatibility.
+            candidates: list[tuple[str, str]] = []
+            if not USE_DEEPGRAM_V1_ONLY:
+                candidates.append(
+                    (
+                        "v2_detect_language",
+                        DEEPGRAM_V2_URL
+                        + common
+                        + "&vad_events=true"
+                        + "&endpointing=300"
+                        + "&detect_language=true",
+                    )
+                )
+            candidates.append(
+                (
+                    "v1_detect_language",
+                    DEEPGRAM_V1_URL
+                    + common
+                    + "&vad_events=true"
+                    + "&endpointing=300"
+                    + "&detect_language=true",
+                )
+            )
+            # Last-resort fallback: pin language so the agent can still respond.
+            candidates.append(
+                (
+                    "v1_pinned_language",
+                    DEEPGRAM_V1_URL
+                    + common
+                    + "&vad_events=true"
+                    + "&endpointing=300"
+                    + f"&language={self.language}",
+                )
+            )
+
+            last_error: Optional[BaseException] = None
+            for label, url in candidates:
+                try:
+                    logger.info("Connecting to Deepgram", endpoint=label)
+                    self._ws = await websockets.connect(
+                        url,
+                        additional_headers=headers,
+                        open_timeout=10,
+                    )
+                    logger.info("Deepgram STT connected", endpoint=label)
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "Deepgram connection attempt failed",
+                        endpoint=label,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
+                    self._ws = None
+
+            if not self._ws:
+                raise RuntimeError(
+                    f"All Deepgram connection attempts failed: {type(last_error).__name__ if last_error else 'unknown'}"
+                )
+
             self._is_connected = True
             
             # Start receiving messages
             self._receive_task = asyncio.create_task(self._receive_loop())
-            
-            logger.info("Deepgram STT connected")
             return True
             
         except Exception as e:
-            logger.error("Deepgram connection failed", error=str(e))
+            logger.error(
+                "Deepgram connection failed",
+                error_type=type(e).__name__,
+                error=str(e),
+            )
             return False
     
     async def disconnect(self) -> None:
@@ -220,7 +263,7 @@ class DeepgramSTT:
 
         self._maybe_update_language_detection(data)
         
-        if msg_type == "Results":
+        if msg_type_norm == "results":
             channel = data.get("channel", {})
             alternatives = channel.get("alternatives", [])
             
@@ -272,7 +315,7 @@ class DeepgramSTT:
             if self._on_speech_started:
                 await self._on_speech_started()
                 
-        elif msg_type == "UtteranceEnd":
+        elif msg_type_norm in ("utteranceend", "utterance_end"):
             logger.debug("Utterance end detected")
             if self._current_transcript and self._on_transcript:
                 result = TranscriptionResult(
@@ -286,8 +329,12 @@ class DeepgramSTT:
             self._current_transcript = ""
             self._word_count = 0
             
-        elif msg_type == "Error":
-            logger.error("Deepgram error", error=data.get("message", "Unknown"))
+        elif msg_type_norm == "error":
+            logger.error(
+                "Deepgram error",
+                error=data.get("message", "Unknown"),
+                details=data,
+            )
     
     def reset_state(self) -> None:
         """Reset transcript state."""
