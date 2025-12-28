@@ -187,6 +187,10 @@ class VoicePipeline:
         # Silence detection
         self._last_speech_time: float = 0.0
         self._silence_task: Optional[asyncio.Task] = None
+
+        # Debug flags (kept minimal to avoid noisy logs)
+        self._logged_first_media: bool = False
+        self._logged_first_transcript: bool = False
         
         # Twilio client for hangup
         self._twilio_client: Optional[TwilioClient] = None
@@ -404,6 +408,15 @@ class VoicePipeline:
         audio = twilio_ulaw_passthrough(event.payload)
         
         if audio:
+            if not self._logged_first_media:
+                self._logged_first_media = True
+                logger.info(
+                    "Inbound media received",
+                    call_sid=self.call_sid,
+                    stream_sid=self.stream_sid,
+                    bytes=len(audio),
+                    track=getattr(event, "track", None),
+                )
             await self._stt.send_audio(audio)
             self._last_speech_time = time.time()
             
@@ -428,6 +441,17 @@ class VoicePipeline:
         """
         if not self._is_running:
             return
+
+        if not self._logged_first_transcript and result.text:
+            self._logged_first_transcript = True
+            logger.info(
+                "First STT transcript received",
+                call_sid=self.call_sid,
+                stream_sid=self.stream_sid,
+                is_final=result.is_final,
+                speech_final=result.speech_final,
+                text=result.text[:80],
+            )
         
         # Check for interruption during TTS
         if self._state == PipelineState.SPEAKING:
