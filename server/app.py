@@ -169,7 +169,7 @@ async def generate_twiml(request: Request) -> Response:
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://{config.public_host}/ws" track="both" />
+        <Stream url="wss://{config.public_host}/ws" />
     </Connect>
 </Response>"""
     
