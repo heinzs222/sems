@@ -111,6 +111,7 @@ class DeepgramSTT:
     
     async def connect(self) -> bool:
         """Connect to Deepgram streaming API."""
+        global _DEEPGRAM_V2_DISABLED
         if self._is_connected:
             return True
         
@@ -173,7 +174,6 @@ class DeepgramSTT:
                     break
                 except Exception as e:
                     last_error = e
-                    global _DEEPGRAM_V2_DISABLED
                     if (
                         label.startswith("v2_")
                         and type(e).__name__ in ("InvalidStatus", "InvalidStatusCode")
