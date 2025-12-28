@@ -18,10 +18,12 @@ Features:
 """
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Awaitable, List, Dict, Any
 from enum import Enum
 import time
+import unicodedata
 
 import structlog
 from twilio.rest import Client as TwilioClient
@@ -61,6 +63,68 @@ class PipelineState(str, Enum):
     SPEAKING = "speaking"
     INTERRUPTED = "interrupted"
 
+
+class CheckoutPhase(str, Enum):
+    """High-level, menu-only checkout flow state."""
+
+    ORDERING = "ordering"
+    NAME = "name"
+    NAME_CONFIRM = "name_confirm"
+    ADDRESS = "address"
+    ADDRESS_CONFIRM = "address_confirm"
+    COMPLETE = "complete"
+
+
+def _normalize_for_intent(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = text.replace("’", "'")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+_YES_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"(^|\\b)(yes|yeah|yep|correct|thats right|that's right|right|ok|okay|sure)(\\b|$)",
+        r"(^|\\b)(oui|ouais|d'accord|daccord|exact|c'est ca|cest ca)(\\b|$)",
+    )
+)
+
+_NO_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"(^|\\b)(no|nope|nah|wrong|not correct)(\\b|$)",
+        r"(^|\\b)(non|pas du tout|c'est pas ca|cest pas ca)(\\b|$)",
+    )
+)
+
+_DONE_ORDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"\\b(thats all|that's all|thats it|that's it|nothing else|im done|i'm done|done)(\\b|$)",
+        r"\\b(c'est tout|cest tout|rien d'autre|j'ai fini|jai fini|c'est bon|cest bon)(\\b|$)",
+    )
+)
+
+_MODIFY_ORDER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"\\b(add|actually|instead|change|wait|hold on)(\\b|$)",
+        r"\\b(ajoute|ajouter|finalement|au fait|changer|attends)(\\b|$)",
+    )
+)
+
+_GOODBYE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"\\b(bye|goodbye|hang up|end call)(\\b|$)",
+        r"\\b(au revoir|bye bye|raccroche|raccrocher)(\\b|$)",
+    )
+)
+
+_CA_POSTAL_RE = re.compile(r"\\b([a-z]\\d[a-z])\\s?(\\d[a-z]\\d)\\b", re.IGNORECASE)
 
 @dataclass
 class TurnMetrics:
@@ -163,6 +227,11 @@ class VoicePipeline:
         self._current_turn = 0
         self._current_turn_metrics: Optional[TurnMetrics] = None
         self._call_metrics = CallMetrics()
+
+        # Menu-only checkout flow (order -> name -> address -> confirm)
+        self._checkout_phase: CheckoutPhase = CheckoutPhase.ORDERING
+        self._customer_name: str = ""
+        self._customer_address: str = ""
         
         # TTS state
         self._pending_transcript: str = ""
@@ -200,6 +269,285 @@ class VoicePipeline:
         if self._lang_state.current == "fr":
             return self.config.cartesia_voice_id_fr or self.config.cartesia_voice_id
         return self.config.cartesia_voice_id
+
+    @staticmethod
+    def _matches_any(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
+        t = _normalize_for_intent(text)
+        if not t:
+            return False
+        return any(p.search(t) for p in patterns)
+
+    def _is_affirmative(self, text: str) -> bool:
+        return self._matches_any(_YES_PATTERNS, text)
+
+    def _is_negative(self, text: str) -> bool:
+        return self._matches_any(_NO_PATTERNS, text)
+
+    def _wants_done_order(self, text: str) -> bool:
+        return self._matches_any(_DONE_ORDER_PATTERNS, text)
+
+    def _wants_modify_order(self, text: str) -> bool:
+        return self._matches_any(_MODIFY_ORDER_PATTERNS, text)
+
+    def _wants_goodbye(self, text: str) -> bool:
+        return self._matches_any(_GOODBYE_PATTERNS, text)
+
+    def _extract_name(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+
+        normalized = _normalize_for_intent(t)
+        patterns = (
+            r"^(my name is|this is|it's|it is)\\s+",
+            r"^(je m'appelle|mon nom est|c'est)\\s+",
+        )
+        for pat in patterns:
+            normalized = re.sub(pat, "", normalized, flags=re.IGNORECASE)
+
+        # Prefer the original casing when possible by removing common prefixes again.
+        original = t
+        original = re.sub(r"^(?i)(my name is|this is|it's|it is)\\s+", "", original).strip()
+        original = re.sub(r"^(?i)(je m'appelle|mon nom est|c'est)\\s+", "", original).strip()
+        return original if original else normalized
+
+    def _extract_address(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+        original = t
+        original = re.sub(r"^(?i)(my address is|address is|it's|it is)\\s+", "", original).strip()
+        original = re.sub(r"^(?i)(mon adresse est|l'adresse est|adresse|c'est)\\s+", "", original).strip()
+        return original if original else t
+
+    def _spell_alnum(self, value: str) -> str:
+        chars: List[str] = []
+        for ch in (value or "").strip():
+            if ch.isalnum():
+                chars.append(ch.upper() if ch.isalpha() else ch)
+        return ", ".join(chars)
+
+    def _spell_postal_code(self, address: str) -> Optional[str]:
+        match = _CA_POSTAL_RE.search(address or "")
+        if not match:
+            return None
+        code = (match.group(1) + match.group(2)).replace(" ", "")
+        spelled = self._spell_alnum(code)
+        return spelled or None
+
+    def _spell_first_number(self, text: str) -> Optional[str]:
+        match = re.search(r"\\b(\\d{1,6})\\b", text or "")
+        if not match:
+            return None
+        digits = match.group(1)
+        return ", ".join(list(digits))
+
+    async def _handle_checkout_flow(self, transcript: str) -> bool:
+        """
+        Handle menu-only checkout steps (name/address) deterministically.
+
+        Returns True if handled (we spoke a response and should not call the LLM).
+        """
+        if not self.config.menu_only:
+            return False
+
+        language = self._lang_state.current
+
+        # Let callers jump back to ordering at any time.
+        if self._checkout_phase != CheckoutPhase.ORDERING and self._wants_modify_order(transcript):
+            self._checkout_phase = CheckoutPhase.ORDERING
+            msg = (
+                "Bien sûr ! Qu’est-ce que vous voulez ajouter ?"
+                if language == "fr"
+                else "Absolutely! What would you like to add?"
+            )
+            await self._speak_response(msg)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.ORDERING:
+            if self._wants_goodbye(transcript):
+                goodbye = (
+                    "Merci ! À bientôt."
+                    if language == "fr"
+                    else "Thanks! Bye for now."
+                )
+                await self._speak_response(goodbye)
+                await self._hangup_call()
+                return True
+
+            if not self._wants_done_order(transcript):
+                return False
+
+            # Start checkout: ask for name.
+            self._checkout_phase = CheckoutPhase.NAME
+            self._customer_name = ""
+            self._customer_address = ""
+            prompt = (
+                "Parfait ! Pour confirmer la commande, quel est votre nom ?"
+                if language == "fr"
+                else "Perfect! To confirm the order, what name should I put it under?"
+            )
+            await self._speak_response(prompt)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.NAME:
+            name = self._extract_name(transcript)
+            if not name:
+                retry = (
+                    "Désolé, je n’ai pas bien compris. Quel est votre nom ?"
+                    if language == "fr"
+                    else "Sorry—I didn’t catch that. What’s your name?"
+                )
+                await self._speak_response(retry)
+                return True
+
+            self._customer_name = name
+            spelled = self._spell_alnum(name)
+            confirm = (
+                f"Super ! J’ai noté {name}. Je l’épelle: {spelled}. C’est bien ça ?"
+                if language == "fr"
+                else f"Awesome! I got {name}. That’s {spelled}. Did I spell that right?"
+            )
+            self._checkout_phase = CheckoutPhase.NAME_CONFIRM
+            await self._speak_response(confirm)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.NAME_CONFIRM:
+            if self._is_affirmative(transcript):
+                self._checkout_phase = CheckoutPhase.ADDRESS
+                ask = (
+                    "Parfait. Et votre adresse, s’il vous plaît ?"
+                    if language == "fr"
+                    else "Great. And what’s your address?"
+                )
+                await self._speak_response(ask)
+                return True
+
+            if self._is_negative(transcript):
+                self._checkout_phase = CheckoutPhase.NAME
+                ask = (
+                    "Oups, d’accord. Pouvez-vous répéter votre nom lentement ?"
+                    if language == "fr"
+                    else "Oops—okay. Can you repeat your name slowly?"
+                )
+                await self._speak_response(ask)
+                return True
+
+            reprompt = (
+                "Juste pour confirmer: est-ce que l’orthographe est correcte ? Oui ou non ?"
+                if language == "fr"
+                else "Quick check—did I spell your name correctly? Yes or no?"
+            )
+            await self._speak_response(reprompt)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.ADDRESS:
+            address = self._extract_address(transcript)
+            if not address:
+                retry = (
+                    "Désolé, je n’ai pas compris l’adresse. Pouvez-vous la répéter ?"
+                    if language == "fr"
+                    else "Sorry—I didn’t catch the address. Can you repeat it?"
+                )
+                await self._speak_response(retry)
+                return True
+
+            self._customer_address = address
+            spelled_number = self._spell_first_number(address)
+            spelled_postal = self._spell_postal_code(address)
+
+            parts: List[str] = []
+            if spelled_number:
+                parts.append(
+                    f"numéro {spelled_number}"
+                    if language == "fr"
+                    else f"number {spelled_number}"
+                )
+            if spelled_postal:
+                parts.append(
+                    f"code postal {spelled_postal}"
+                    if language == "fr"
+                    else f"postal code {spelled_postal}"
+                )
+            spelled_bits = "; ".join(parts)
+
+            if language == "fr":
+                confirm = (
+                    f"Parfait. J’ai noté: {address}. Pour confirmer: {spelled_bits}. C’est exact ?"
+                    if spelled_bits
+                    else f"Parfait. J’ai noté: {address}. C’est exact ?"
+                )
+            else:
+                confirm = (
+                    f"Great. I got: {address}. Just to confirm: {spelled_bits}. Is that correct?"
+                    if spelled_bits
+                    else f"Great. I got: {address}. Is that correct?"
+                )
+            self._checkout_phase = CheckoutPhase.ADDRESS_CONFIRM
+            await self._speak_response(confirm)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.ADDRESS_CONFIRM:
+            if self._is_affirmative(transcript):
+                self._checkout_phase = CheckoutPhase.COMPLETE
+                done = (
+                    f"Parfait ! Votre commande est confirmée au nom de {self._customer_name}, à {self._customer_address}. Vous voulez ajouter autre chose ?"
+                    if language == "fr"
+                    else f"Perfect! Your order is confirmed under {self._customer_name} at {self._customer_address}. Anything else you’d like to add?"
+                )
+                await self._speak_response(done)
+                return True
+
+            if self._is_negative(transcript):
+                self._checkout_phase = CheckoutPhase.ADDRESS
+                ask = (
+                    "Oups, d’accord. Pouvez-vous répéter l’adresse lentement ?"
+                    if language == "fr"
+                    else "Oops—okay. Can you repeat the address slowly?"
+                )
+                await self._speak_response(ask)
+                return True
+
+            reprompt = (
+                "Juste pour confirmer: est-ce que l’adresse est correcte ? Oui ou non ?"
+                if language == "fr"
+                else "Quick check—is that address correct? Yes or no?"
+            )
+            await self._speak_response(reprompt)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.COMPLETE:
+            if self._wants_goodbye(transcript) or self._wants_done_order(transcript) or self._is_negative(transcript):
+                goodbye = (
+                    "Parfait, merci ! À bientôt."
+                    if language == "fr"
+                    else "Perfect—thank you! Bye for now."
+                )
+                await self._speak_response(goodbye)
+                await self._hangup_call()
+                return True
+
+            # If they say "yes" here, they likely want to add more items.
+            if self._is_affirmative(transcript):
+                self._checkout_phase = CheckoutPhase.ORDERING
+                msg = (
+                    "Super ! Qu’est-ce que vous voulez ajouter ?"
+                    if language == "fr"
+                    else "Awesome! What would you like to add?"
+                )
+                await self._speak_response(msg)
+                return True
+
+            # Default: keep it friendly and guide them back.
+            prompt = (
+                "D’accord. Vous voulez ajouter quelque chose au menu, ou c’est tout ?"
+                if language == "fr"
+                else "Got it. Do you want to add anything from the menu, or is that all?"
+            )
+            await self._speak_response(prompt)
+            return True
+
+        return False
     
     async def _apply_language_override(self, target: LanguageCode) -> None:
         """Apply an explicit user override and confirm once."""
@@ -377,9 +725,9 @@ class VoicePipeline:
 
         # Send initial greeting (always).
         greeting = (
-            f"Bonjour ! Je suis {self.config.agent_name} de {self.config.company_name}. Je peux vous aider avec le menu et prendre votre commande. Qu’est-ce que vous aimeriez ?"
+            f"Allô ! Merci d’appeler {self.config.company_name} — je suis {self.config.agent_name}. Qu’est-ce que je vous prépare aujourd’hui ?"
             if self._lang_state.current == "fr"
-            else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. I can help with the menu and take your order. What would you like?"
+            else f"Hi! Thanks for calling {self.config.company_name} — I’m {self.config.agent_name}. What can I get you from the menu today?"
         )
         # Speak greeting in a background task so STT can keep processing.
         if self._output_task and not self._output_task.done():
@@ -614,6 +962,10 @@ class VoicePipeline:
             previous_language=previous_language,
             detection_source=detection_source,
         )
+
+        # Menu-only checkout flow: name/address confirmation (with spelling).
+        if await self._handle_checkout_flow(transcript):
+            return
         
         # Try semantic routing first
         if (
@@ -722,7 +1074,8 @@ class VoicePipeline:
                 "RÈGLES:\n"
                 "- Utilise uniquement les articles et prix listés ici.\n"
                 "- Aide l'appelant à choisir et à commander : demande la quantité, confirme ce que tu as noté, puis demande s'il veut autre chose.\n"
-                "- Quand l'appelant dit que c'est tout : récapitule et confirme que la commande est prise et confirmée.\n"
+                "- Quand l'appelant dit que c'est tout : passe à la confirmation (nom puis adresse). Confirme l'orthographe en épelant le nom, et épelle au moins le numéro et le code postal.\n"
+                "- Une fois confirmé : confirme que la commande est prise et confirmée.\n"
                 "- Ne réponds pas aux questions hors-menu ; redirige vers le menu.\n"
                 "- Réponses courtes, 1 question à la fois.\n"
             )
@@ -732,7 +1085,8 @@ class VoicePipeline:
                 "RULES:\n"
                 "- Use only the items and prices listed here.\n"
                 "- Help the caller choose and place a (simulated) order: ask quantity, confirm what you recorded, then ask if they want anything else.\n"
-                "- When the caller says they're done: summarize and confirm the order is taken and confirmed.\n"
+                "- When the caller says they're done: move to checkout (name then address). Confirm spelling by spelling the name and at least the street number and postal code.\n"
+                "- Once confirmed: confirm the order is taken and confirmed.\n"
                 "- Do not answer non-menu questions; redirect back to the menu.\n"
                 "- Keep it short and ask 1 question at a time.\n"
             )
