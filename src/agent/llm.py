@@ -337,18 +337,16 @@ class GroqLLM:
         return self._history.get_messages()
 
 
-_llm_instance: Optional[GroqLLM] = None
+def create_llm(config: Optional[Any] = None) -> GroqLLM:
+    """
+    Create a new LLM client instance.
 
-
-def get_llm() -> GroqLLM:
-    global _llm_instance
-    if _llm_instance is None:
-        _llm_instance = GroqLLM()
-    return _llm_instance
+    Important: this must be per-call because it owns conversation history.
+    """
+    return GroqLLM(config=config)
 
 
 async def initialize_llm() -> GroqLLM:
-    llm = get_llm()
+    llm = create_llm()
     await llm.validate_model()
     return llm
-

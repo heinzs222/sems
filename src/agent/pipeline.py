@@ -41,7 +41,7 @@ from src.agent.twilio_protocol import (
 )
 from src.agent.stt import STTManager, TranscriptionResult
 from src.agent.tts import TTSManager, TTSChunk
-from src.agent.llm import GroqLLM, get_llm
+from src.agent.llm import GroqLLM, create_llm
 from src.agent.routing import get_semantic_router, SemanticRouter
 from src.agent.extract import ExtractionQueue
 from src.agent.language import (
@@ -126,6 +126,14 @@ _GOODBYE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     for p in (
         r"\\b(bye|goodbye|hang up|end call)(\\b|$)",
         r"\\b(au revoir|bye bye|raccroche|raccrocher)(\\b|$)",
+    )
+)
+
+_HANGUP_NOW_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p)
+    for p in (
+        r"\\b(hang up|end call)(\\b|$)",
+        r"\\b(raccroche|raccrocher)(\\b|$)",
     )
 )
 
@@ -579,7 +587,10 @@ class VoicePipeline:
                     else "Thanks! Bye for now."
                 )
                 await self._speak_response(goodbye)
-                await self._hangup_call()
+                # Avoid hanging up automatically on simple goodbyes; PSTN callers often
+                # prefer to hang up themselves, and false positives are costly.
+                if self._matches_any(_HANGUP_NOW_PATTERNS, transcript):
+                    await self._hangup_call()
                 return True
 
             if not self._wants_done_order(transcript):
@@ -828,14 +839,24 @@ class VoicePipeline:
             return True
 
         if self._checkout_phase == CheckoutPhase.COMPLETE:
-            if self._wants_goodbye(transcript) or self._wants_done_order(transcript) or self._is_negative(transcript):
+            if self._wants_goodbye(transcript):
                 goodbye = (
                     "Parfait, merci ! À bientôt."
                     if language == "fr"
                     else "Perfect—thank you! Bye for now."
                 )
                 await self._speak_response(goodbye)
-                await self._hangup_call()
+                if self._matches_any(_HANGUP_NOW_PATTERNS, transcript):
+                    await self._hangup_call()
+                return True
+
+            if self._wants_done_order(transcript) or self._is_negative(transcript):
+                closing = (
+                    "Parfait—merci ! Votre commande est confirmée. Si vous avez besoin d'autre chose, je suis là; sinon vous pouvez raccrocher quand vous voulez."
+                    if language == "fr"
+                    else "Perfect—thank you! Your order is confirmed. If you need anything else, I'm here; otherwise you can hang up whenever you're ready."
+                )
+                await self._speak_response(closing)
                 return True
 
             # If they say "yes" here, they likely want to add more items.
@@ -908,7 +929,7 @@ class VoicePipeline:
         logger.info("Starting voice pipeline")
         
         # Initialize LLM
-        self._llm = get_llm()
+        self._llm = create_llm()
         
         # Initialize router if enabled
         if self.config.router_enabled and not self.config.menu_only:
@@ -1452,9 +1473,10 @@ class VoicePipeline:
                 "RÈGLES:\n"
                 "- Utilise uniquement les articles et prix listés ici.\n"
                 "- Aide l'appelant à choisir et à commander : demande la quantité, confirme ce que tu as noté, puis demande s'il veut autre chose.\n"
-                "- Quand l'appelant dit que c'est tout : passe à la confirmation (nom puis adresse). Confirme l'orthographe en épelant le nom, et épelle au moins le numéro et le code postal.\n"
-                "- Une fois confirmé : confirme que la commande est prise et confirmée.\n"
-                "- Ne réponds pas aux questions hors-menu ; redirige vers le menu.\n"
+                "- Quand l'appelant dit que c'est tout : passe au checkout (nom, adresse, téléphone, email). Confirme chaque info en la répétant/épelant puis demande si c'est correct.\n"
+                "- Adresse: épelle au moins le numéro et le code postal. Téléphone: répète les chiffres. Email: répète lentement et, si besoin, demande de l'épeler.\n"
+                "- Ne confirme la commande (prise/confirmée) qu'après avoir obtenu ET fait confirmer: nom, adresse, téléphone et email.\n"
+                "- Si l'appelant demande autre chose que le menu: réponds brièvement avec empathie, puis ramène doucement au menu.\n"
                 "- Réponses courtes, 1 question à la fois.\n"
             )
         else:
@@ -1463,9 +1485,10 @@ class VoicePipeline:
                 "RULES:\n"
                 "- Use only the items and prices listed here.\n"
                 "- Help the caller choose and place a (simulated) order: ask quantity, confirm what you recorded, then ask if they want anything else.\n"
-                "- When the caller says they're done: move to checkout (name then address). Confirm spelling by spelling the name and at least the street number and postal code.\n"
-                "- Once confirmed: confirm the order is taken and confirmed.\n"
-                "- Do not answer non-menu questions; redirect back to the menu.\n"
+                "- When the caller says they're done: move to checkout (name, address, phone number, email). Confirm each by repeating/spelling it back and asking if it's correct.\n"
+                "- Address: spell at least the street number and postal code. Phone: repeat digits. Email: repeat slowly and ask them to spell it if needed.\n"
+                "- Do not confirm the order as taken/confirmed until you have AND confirmed: name, address, phone number, and email.\n"
+                "- If the caller asks about non-menu topics: respond briefly with empathy, then gently steer back to the menu.\n"
                 "- Keep it short and ask 1 question at a time.\n"
             )
 
