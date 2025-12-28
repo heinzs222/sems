@@ -69,6 +69,7 @@ class DeepgramSTT:
     def __init__(
         self,
         on_transcript: Optional[Callable[[TranscriptionResult], Awaitable[None]]] = None,
+        on_speech_started: Optional[Callable[[], Awaitable[None]]] = None,
         language: Optional[str] = None,
         config: Optional[Any] = None,
     ):
@@ -78,6 +79,7 @@ class DeepgramSTT:
         self.config = config
         self.language = language or getattr(config, "deepgram_language_en", "en-US")
         self._on_transcript = on_transcript
+        self._on_speech_started = on_speech_started
         self._ws = None
         self._is_connected = False
         self._metrics = STTMetrics()
@@ -117,6 +119,7 @@ class DeepgramSTT:
                     f"&punctuate=true"
                     f"&interim_results=true"
                     f"&vad_events=true"
+                    f"&speech_started=true"
                     f"&smart_format=true"
                 )
                 url = DEEPGRAM_V2_URL + params
@@ -131,8 +134,10 @@ class DeepgramSTT:
                     f"&channels=1"
                     f"&punctuate=true"
                     f"&interim_results=true"
+                    f"&vad_events=true"
+                    f"&speech_started=true"
                     f"&smart_format=true"
-                    f"&endpointing=500"
+                    f"&endpointing=300"
                 )
                 url = DEEPGRAM_V1_URL + params
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}
@@ -209,6 +214,7 @@ class DeepgramSTT:
     async def _handle_message(self, data: dict) -> None:
         """Handle a message from Deepgram."""
         msg_type = data.get("type", "")
+        msg_type_norm = msg_type.lower() if isinstance(msg_type, str) else ""
         
         if msg_type == "Results":
             channel = data.get("channel", {})
@@ -254,6 +260,11 @@ class DeepgramSTT:
             
             if self._on_transcript:
                 await self._on_transcript(result)
+        
+        elif msg_type_norm in ("speechstarted", "speech_started", "speech_start"):
+            logger.debug("STT speech started")
+            if self._on_speech_started:
+                await self._on_speech_started()
                 
         elif msg_type == "UtteranceEnd":
             logger.debug("Utterance end detected")
@@ -282,12 +293,19 @@ class STTManager:
     def __init__(self):
         self._stt: Optional[DeepgramSTT] = None
         self._transcript_callback: Optional[Callable[[TranscriptionResult], Awaitable[None]]] = None
+        self._speech_started_callback: Optional[Callable[[], Awaitable[None]]] = None
     
     def set_transcript_callback(
         self, 
         callback: Callable[[TranscriptionResult], Awaitable[None]]
     ) -> None:
         self._transcript_callback = callback
+    
+    def set_speech_started_callback(
+        self,
+        callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._speech_started_callback = callback
     
     async def start(self, language: Optional[str] = None) -> bool:
         return await self.restart(language=language)
@@ -303,6 +321,7 @@ class STTManager:
         if self._stt is None:
             self._stt = DeepgramSTT(
                 on_transcript=self._transcript_callback,
+                on_speech_started=self._speech_started_callback,
                 language=language,
             )
             return await self._stt.connect()
@@ -310,6 +329,7 @@ class STTManager:
         previous = self._stt
         candidate = DeepgramSTT(
             on_transcript=self._transcript_callback,
+            on_speech_started=self._speech_started_callback,
             language=language,
         )
         

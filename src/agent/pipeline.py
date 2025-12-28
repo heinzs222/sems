@@ -104,6 +104,12 @@ class CallMetrics:
             ) if self.turns else 0,
         }
 
+@dataclass
+class QueuedTranscript:
+    """A final transcript queued for turn processing."""
+    text: str
+    stt_latency_ms: float = 0.0
+
 
 class VoicePipeline:
     """
@@ -147,8 +153,16 @@ class VoicePipeline:
         self._call_metrics = CallMetrics()
         
         # TTS state
-        self._tts_task: Optional[asyncio.Task] = None
         self._pending_transcript: str = ""
+        
+        # Turn processing (keep STT receive loop non-blocking)
+        self._turn_queue: asyncio.Queue[QueuedTranscript] = asyncio.Queue()
+        self._turn_worker_task: Optional[asyncio.Task] = None
+        self._turn_task: Optional[asyncio.Task] = None
+        
+        # Output task (e.g., greeting) and barge-in gating
+        self._output_task: Optional[asyncio.Task] = None
+        self._speech_started_during_tts: bool = False
         
         # Outbound audio pacer (Late-2025 best practice)
         self._audio_queue: asyncio.Queue = asyncio.Queue()
@@ -241,6 +255,7 @@ class VoicePipeline:
         
         # Set up STT callback
         self._stt.set_transcript_callback(self._on_transcript)
+        self._stt.set_speech_started_callback(self._on_speech_started)
         
         # Initialize Twilio client for hangup
         if self.config.twilio_account_sid and self.config.twilio_auth_token:
@@ -252,6 +267,10 @@ class VoicePipeline:
         self._is_running = True
         self._state = PipelineState.IDLE
         
+        # Start turn worker (runs LLM/TTS without blocking STT receive loop)
+        if self._turn_worker_task is None or self._turn_worker_task.done():
+            self._turn_worker_task = asyncio.create_task(self._turn_worker())
+        
         logger.info("Voice pipeline started")
     
     async def stop(self) -> None:
@@ -261,11 +280,16 @@ class VoicePipeline:
         self._is_running = False
         
         # Cancel any ongoing tasks
-        if self._tts_task and not self._tts_task.done():
-            self._tts_task.cancel()
+        tasks_to_cancel: List[asyncio.Task] = []
+        for task in (self._output_task, self._turn_task, self._turn_worker_task, self._silence_task):
+            if task and not task.done():
+                task.cancel()
+                tasks_to_cancel.append(task)
         
-        if self._silence_task and not self._silence_task.done():
-            self._silence_task.cancel()
+        await self._stop_pacer()
+        
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         
         # Stop components
         await self._stt.stop()
@@ -337,7 +361,10 @@ class VoicePipeline:
                 if self._language == "fr"
                 else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. How can I help you today?"
             )
-            await self._speak_response(greeting)
+            # Speak greeting in a background task so STT can keep processing.
+            if self._output_task and not self._output_task.done():
+                self._output_task.cancel()
+            self._output_task = asyncio.create_task(self._speak_response(greeting))
         else:
             logger.error("Failed to start STT")
     
@@ -358,6 +385,15 @@ class VoicePipeline:
             if self._silence_task is None or self._silence_task.done():
                 self._silence_task = asyncio.create_task(self._silence_detector())
     
+    async def _on_speech_started(self) -> None:
+        """Handle VAD speech-start event from STT (used for barge-in)."""
+        if not self._is_running:
+            return
+        
+        if self._state == PipelineState.SPEAKING:
+            self._speech_started_during_tts = True
+            logger.debug("Speech started detected during TTS")
+
     async def _on_transcript(self, result: TranscriptionResult) -> None:
         """
         Handle STT transcript.
@@ -371,7 +407,18 @@ class VoicePipeline:
         if self._state == PipelineState.SPEAKING:
             word_count = len(result.text.split())
             
-            if word_count >= self.config.min_interruption_words:
+            # Active collision (cough filter):
+            # If VAD says speech started, interrupt on the first interim word.
+            if self._speech_started_during_tts and word_count >= 1:
+                logger.info(
+                    "Interruption detected (speech_started latch)",
+                    word_count=word_count,
+                )
+                await self._handle_interruption()
+                self._pending_transcript = result.text
+                self._speech_started_during_tts = False
+            
+            elif word_count >= self.config.min_interruption_words:
                 logger.info(
                     "Interruption detected",
                     word_count=word_count,
@@ -393,13 +440,7 @@ class VoicePipeline:
                 self._pending_transcript = ""
             
             logger.info("Final transcript", text=transcript[:100])
-            
-            # Start new turn
-            self._start_turn()
-            self._current_turn_metrics.stt_ms = result.latency_ms
-            
-            # Process the transcript
-            await self._process_transcript(transcript)
+            await self._turn_queue.put(QueuedTranscript(text=transcript, stt_latency_ms=result.latency_ms))
     
     async def _handle_interruption(self) -> None:
         """Handle user interruption during TTS playback."""
@@ -410,24 +451,42 @@ class VoicePipeline:
         
         self._state = PipelineState.INTERRUPTED
         self._call_metrics.total_interruptions += 1
+        self._speech_started_during_tts = False
         
         if self._current_turn_metrics:
             self._current_turn_metrics.was_interrupted = True
         
-        # Cancel TTS
+        # Cancel any active output/turn task so we stop producing audio immediately.
+        if self._output_task and not self._output_task.done():
+            self._output_task.cancel()
+        
+        if self._turn_task and not self._turn_task.done():
+            self._turn_task.cancel()
+        
+        # Nuclear flush:
+        # - Cancel Cartesia context (best effort)
+        # - Stop our pacer + drop queued audio
+        # - Clear Twilio's buffered audio
+        tasks: List[asyncio.Future] = []
+        
+        try:
+            tasks.append(asyncio.create_task(self._tts.cancel_context()))
+        except Exception:
+            pass
+        
         self._tts.cancel_current()
+        tasks.append(asyncio.create_task(self._stop_pacer()))
+        self._outbound_ulaw_remainder = b""
         
-        if self._tts_task and not self._tts_task.done():
-            self._tts_task.cancel()
-            try:
-                await self._tts_task
-            except asyncio.CancelledError:
-                pass
-        
-        # Send clear to Twilio to stop buffered audio
         clear_msg = self._protocol.create_clear()
         if clear_msg:
-            await self._send_message(clear_msg)
+            tasks.append(asyncio.create_task(self._send_message(clear_msg)))
+        
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.debug("Interruption cleanup task failed", error=str(r))
         
         # Reset STT state
         self._stt.reset_state()
@@ -446,7 +505,6 @@ class VoicePipeline:
         target_language = detect_language_switch_command(transcript)
         if target_language and target_language != self._language:
             await self._switch_language(target_language, transcript)
-            self._end_turn()
             return
         
         # Try semantic routing first
@@ -466,8 +524,6 @@ class VoicePipeline:
                 # Handle hangup for "stop" route
                 if should_hangup:
                     await self._hangup_call()
-                
-                self._end_turn()
                 return
         
         # Fall back to LLM
@@ -483,9 +539,9 @@ class VoicePipeline:
         first_token_time = None
         full_response = ""
         
-        # Collect LLM response and stream to TTS
+        # Collect LLM response (keep processing state until we actually speak)
         try:
-            self._state = PipelineState.SPEAKING
+            self._state = PipelineState.PROCESSING
             
             async for chunk in self._llm.generate_streaming(transcript, language=self._language):
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
@@ -522,9 +578,48 @@ class VoicePipeline:
         except Exception as e:
             logger.error("LLM generation failed", error=str(e))
         finally:
-            self._end_turn()
             if self._state == PipelineState.SPEAKING:
                 self._state = PipelineState.LISTENING
+            self._speech_started_during_tts = False
+
+    async def _run_turn(self, queued: QueuedTranscript) -> None:
+        """Run a single conversation turn from a final transcript."""
+        self._start_turn()
+        if self._current_turn_metrics:
+            self._current_turn_metrics.stt_ms = queued.stt_latency_ms
+        
+        try:
+            await self._process_transcript(queued.text)
+        except asyncio.CancelledError:
+            logger.debug("Turn cancelled")
+        except Exception as e:
+            logger.error("Turn failed", error=str(e))
+        finally:
+            self._end_turn()
+            if self._state == PipelineState.INTERRUPTED:
+                self._state = PipelineState.LISTENING
+
+    async def _turn_worker(self) -> None:
+        """Background worker that processes queued final transcripts sequentially."""
+        try:
+            while self._is_running:
+                try:
+                    queued = await asyncio.wait_for(self._turn_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                
+                try:
+                    self._turn_task = asyncio.create_task(self._run_turn(queued))
+                    try:
+                        await self._turn_task
+                    except asyncio.CancelledError:
+                        # Turn cancellation is expected during barge-in.
+                        pass
+                finally:
+                    self._turn_task = None
+                    self._turn_queue.task_done()
+        except asyncio.CancelledError:
+            pass
     
     async def _audio_pacer(self) -> None:
         """
@@ -746,6 +841,7 @@ class VoicePipeline:
         finally:
             if self._state == PipelineState.SPEAKING:
                 self._state = PipelineState.LISTENING
+            self._speech_started_during_tts = False
     
     async def _silence_detector(self) -> None:
         """

@@ -303,6 +303,11 @@ class TTSManager:
             await self._tts.close()
             self._tts = None
     
+    async def cancel_context(self) -> None:
+        """Cancel the current Cartesia context (if any)."""
+        if self._tts:
+            await self._tts.cancel_context()
+    
     def cancel_current(self) -> None:
         """Cancel current synthesis."""
         if self._tts:
