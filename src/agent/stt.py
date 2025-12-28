@@ -122,7 +122,6 @@ class DeepgramSTT:
                     f"&punctuate=true"
                     f"&interim_results=true"
                     f"&vad_events=true"
-                    f"&speech_started=true"
                     f"&smart_format=true"
                     f"&detect_language=true"
                 )
@@ -138,7 +137,6 @@ class DeepgramSTT:
                     f"&punctuate=true"
                     f"&interim_results=true"
                     f"&vad_events=true"
-                    f"&speech_started=true"
                     f"&smart_format=true"
                     f"&endpointing=300"
                     f"&detect_language=true"

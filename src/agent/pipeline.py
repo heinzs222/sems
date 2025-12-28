@@ -170,6 +170,7 @@ class VoicePipeline:
         self._turn_queue: asyncio.Queue[QueuedTranscript] = asyncio.Queue()
         self._turn_worker_task: Optional[asyncio.Task] = None
         self._turn_task: Optional[asyncio.Task] = None
+        self._stt_start_task: Optional[asyncio.Task] = None
         
         # Output task (e.g., greeting) and barge-in gating
         self._output_task: Optional[asyncio.Task] = None
@@ -285,7 +286,13 @@ class VoicePipeline:
         
         # Cancel any ongoing tasks
         tasks_to_cancel: List[asyncio.Task] = []
-        for task in (self._output_task, self._turn_task, self._turn_worker_task, self._silence_task):
+        for task in (
+            self._output_task,
+            self._turn_task,
+            self._turn_worker_task,
+            self._silence_task,
+            self._stt_start_task,
+        ):
             if task and not task.done():
                 task.cancel()
                 tasks_to_cancel.append(task)
@@ -349,28 +356,43 @@ class VoicePipeline:
         # Update metrics
         self._call_metrics.call_sid = event.call_sid
         self._call_metrics.stream_sid = event.stream_sid
-        
-        # Start STT
-        if await self._stt.start():
-            self._state = PipelineState.LISTENING
-            logger.info(
-                "Call started, listening",
-                call_sid=event.call_sid,
-                stream_sid=event.stream_sid,
-            )
-            
-            # Send initial greeting
-            greeting = (
-                f"Bonjour ! Je suis {self.config.agent_name} de {self.config.company_name}. Comment puis-je vous aider aujourd'hui ?"
-                if self._lang_state.current == "fr"
-                else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. How can I help you today?"
-            )
-            # Speak greeting in a background task so STT can keep processing.
-            if self._output_task and not self._output_task.done():
-                self._output_task.cancel()
-            self._output_task = asyncio.create_task(self._speak_response(greeting))
-        else:
-            logger.error("Failed to start STT")
+
+        # Enter listening state immediately; we can greet even if STT has issues.
+        self._state = PipelineState.LISTENING
+        logger.info(
+            "Call started",
+            call_sid=event.call_sid,
+            stream_sid=event.stream_sid,
+        )
+
+        # Start STT in the background so a slow STT handshake doesn't block greeting audio.
+        if self._stt_start_task and not self._stt_start_task.done():
+            self._stt_start_task.cancel()
+        self._stt_start_task = asyncio.create_task(self._start_stt_background())
+
+        # Send initial greeting (always).
+        greeting = (
+            f"Bonjour ! Je suis {self.config.agent_name} de {self.config.company_name}. Comment puis-je vous aider aujourd'hui ?"
+            if self._lang_state.current == "fr"
+            else f"Hello! This is {self.config.agent_name} from {self.config.company_name}. How can I help you today?"
+        )
+        # Speak greeting in a background task so STT can keep processing.
+        if self._output_task and not self._output_task.done():
+            self._output_task.cancel()
+        self._output_task = asyncio.create_task(self._speak_response(greeting))
+
+    async def _start_stt_background(self) -> None:
+        """Start STT and log success/failure without blocking call audio output."""
+        try:
+            ok = await self._stt.start()
+            if ok:
+                logger.info("STT ready")
+            else:
+                logger.error("STT failed to start")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error("STT start task error", error=str(e))
     
     async def _handle_media(self, event: TwilioMediaEvent) -> None:
         """Handle incoming audio from Twilio."""
