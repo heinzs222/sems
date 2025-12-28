@@ -214,7 +214,11 @@ class CartesiaTTS:
                             break
                         
                         elif msg_type == "flush_done":
+                            # Cartesia can emit `flush_done` before `done` with a small delay.
+                            # Treat it as end-of-audio so we can flush the last partial 20ms frame immediately
+                            # (prevents an audible pause before the final word).
                             logger.debug("Cartesia flush done")
+                            break
                         
                         # Handle different response formats
                         elif "audio" in data:

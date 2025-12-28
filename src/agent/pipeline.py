@@ -73,6 +73,10 @@ class CheckoutPhase(str, Enum):
     NAME_CONFIRM = "name_confirm"
     ADDRESS = "address"
     ADDRESS_CONFIRM = "address_confirm"
+    PHONE = "phone"
+    PHONE_CONFIRM = "phone_confirm"
+    EMAIL = "email"
+    EMAIL_CONFIRM = "email_confirm"
     COMPLETE = "complete"
 
 
@@ -126,6 +130,7 @@ _GOODBYE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 _CA_POSTAL_RE = re.compile(r"\\b([a-z]\\d[a-z])\\s?(\\d[a-z]\\d)\\b", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b", re.IGNORECASE)
 
 _BARGE_IN_BACKCHANNEL_RE = re.compile(
     r"^(ok|okay|yeah|yep|yup|uh huh|uh-huh|mhm|mm hmm|mm-hmm|oui|ouais|d['’]accord|daccord)([.!?])?$"
@@ -249,10 +254,12 @@ class VoicePipeline:
         self._current_turn_metrics: Optional[TurnMetrics] = None
         self._call_metrics = CallMetrics()
 
-        # Menu-only checkout flow (order -> name -> address -> confirm)
+        # Menu-only checkout flow (order -> name -> address -> phone -> email -> confirm)
         self._checkout_phase: CheckoutPhase = CheckoutPhase.ORDERING
         self._customer_name: str = ""
         self._customer_address: str = ""
+        self._customer_phone: str = ""
+        self._customer_email: str = ""
         
         # TTS state
         self._pending_transcript: str = ""
@@ -469,6 +476,57 @@ class VoicePipeline:
         original = re.sub(r"^(?i)(mon adresse est|l'adresse est|adresse|c'est)\\s+", "", original).strip()
         return original if original else t
 
+    def _extract_phone(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+
+        original = t
+        original = re.sub(r"^(?i)(my phone is|my number is|phone number is|phone is|number is)\\s+", "", original).strip()
+        original = re.sub(r"^(?i)(mon numero est|mon num\\S+ro est|numero|num\\S+ro|telephone|t\\S+l\\S+phone)\\s+", "", original).strip()
+
+        digits = re.sub(r"\D+", "", original)
+        if len(digits) == 11 and digits.startswith("1"):
+            digits = digits[1:]
+        if len(digits) < 10:
+            return ""
+        return digits[-10:]
+
+    def _spell_phone_digits(self, digits: str) -> str:
+        digits = re.sub(r"\D+", "", digits or "")
+        return ", ".join(list(digits))
+
+    def _extract_email(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return ""
+
+        normalized = t.lower()
+        normalized = (
+            normalized.replace(" at ", "@")
+            .replace(" arrobase ", "@")
+            .replace(" dot ", ".")
+            .replace(" point ", ".")
+            .replace(" point final ", ".")
+        )
+        match = _EMAIL_RE.search(normalized)
+        return match.group(0) if match else ""
+
+    def _spell_email(self, email: str, *, language: str) -> str:
+        spoken: List[str] = []
+        for ch in (email or "").strip():
+            if ch.isalnum():
+                spoken.append(ch.upper() if ch.isalpha() else ch)
+            elif ch == "@":
+                spoken.append("AROBAS" if language == "fr" else "AT")
+            elif ch == ".":
+                spoken.append("POINT" if language == "fr" else "DOT")
+            elif ch == "-":
+                spoken.append("TIRET" if language == "fr" else "DASH")
+            elif ch == "_":
+                spoken.append("UNDERSCORE")
+        return ", ".join(spoken)
+
     def _spell_alnum(self, value: str) -> str:
         chars: List[str] = []
         for ch in (value or "").strip():
@@ -531,10 +589,12 @@ class VoicePipeline:
             self._checkout_phase = CheckoutPhase.NAME
             self._customer_name = ""
             self._customer_address = ""
+            self._customer_phone = ""
+            self._customer_email = ""
             prompt = (
-                "Parfait ! Pour confirmer la commande, quel est votre nom ?"
+                "Parfait ! Pour finaliser la commande, quel est votre nom ?"
                 if language == "fr"
-                else "Perfect! To confirm the order, what name should I put it under?"
+                else "Perfect! To finalize, what name should I put it under?"
             )
             await self._speak_response(prompt)
             return True
@@ -638,13 +698,13 @@ class VoicePipeline:
 
         if self._checkout_phase == CheckoutPhase.ADDRESS_CONFIRM:
             if self._is_affirmative(transcript):
-                self._checkout_phase = CheckoutPhase.COMPLETE
-                done = (
-                    f"Parfait ! Votre commande est confirmée au nom de {self._customer_name}, à {self._customer_address}. Vous voulez ajouter autre chose ?"
+                self._checkout_phase = CheckoutPhase.PHONE
+                ask = (
+                    "Parfait. Quel est votre numéro de téléphone ?"
                     if language == "fr"
-                    else f"Perfect! Your order is confirmed under {self._customer_name} at {self._customer_address}. Anything else you’d like to add?"
+                    else "Perfect. What's the best phone number?"
                 )
-                await self._speak_response(done)
+                await self._speak_response(ask)
                 return True
 
             if self._is_negative(transcript):
@@ -661,6 +721,108 @@ class VoicePipeline:
                 "Juste pour confirmer: est-ce que l’adresse est correcte ? Oui ou non ?"
                 if language == "fr"
                 else "Quick check—is that address correct? Yes or no?"
+            )
+            await self._speak_response(reprompt)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.PHONE:
+            phone = self._extract_phone(transcript)
+            if not phone:
+                retry = (
+                    "Désolé, je n'ai pas bien compris le numéro. Vous pouvez le répéter ?"
+                    if language == "fr"
+                    else "Sorry—I didn't catch the phone number. Can you repeat it?"
+                )
+                await self._speak_response(retry)
+                return True
+
+            self._customer_phone = phone
+            spelled = self._spell_phone_digits(phone)
+            confirm = (
+                f"Super. Je l'ai noté: {spelled}. C'est bien ça ?"
+                if language == "fr"
+                else f"Great. I got: {spelled}. Is that right?"
+            )
+            self._checkout_phase = CheckoutPhase.PHONE_CONFIRM
+            await self._speak_response(confirm)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.PHONE_CONFIRM:
+            if self._is_affirmative(transcript):
+                self._checkout_phase = CheckoutPhase.EMAIL
+                ask = (
+                    "Parfait. Et quel est votre email ?"
+                    if language == "fr"
+                    else "Perfect. And what's your email?"
+                )
+                await self._speak_response(ask)
+                return True
+
+            if self._is_negative(transcript):
+                self._checkout_phase = CheckoutPhase.PHONE
+                ask = (
+                    "Oups, d'accord. Pouvez-vous répéter votre numéro lentement ?"
+                    if language == "fr"
+                    else "Oops—okay. Can you repeat the number slowly?"
+                )
+                await self._speak_response(ask)
+                return True
+
+            reprompt = (
+                "Juste pour vérifier: est-ce que le numéro est correct ?"
+                if language == "fr"
+                else "Just to double-check—did I get the phone number right?"
+            )
+            await self._speak_response(reprompt)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.EMAIL:
+            email = self._extract_email(transcript)
+            if not email:
+                retry = (
+                    "Désolé, je n'ai pas compris l'email. Vous pouvez le répéter, ou l'épeler ?"
+                    if language == "fr"
+                    else "Sorry—I didn't catch the email. Can you repeat it, or spell it?"
+                )
+                await self._speak_response(retry)
+                return True
+
+            self._customer_email = email
+            spelled = self._spell_email(email, language=language)
+            confirm = (
+                f"Parfait. Je l'épelle: {spelled}. C'est bien ça ?"
+                if language == "fr"
+                else f"Perfect. I'll spell it: {spelled}. Did I get that right?"
+            )
+            self._checkout_phase = CheckoutPhase.EMAIL_CONFIRM
+            await self._speak_response(confirm)
+            return True
+
+        if self._checkout_phase == CheckoutPhase.EMAIL_CONFIRM:
+            if self._is_affirmative(transcript):
+                self._checkout_phase = CheckoutPhase.COMPLETE
+                done = (
+                    f"Parfait ! Votre commande est confirmée au nom de {self._customer_name}, à {self._customer_address}. Vous voulez ajouter autre chose ?"
+                    if language == "fr"
+                    else f"Perfect! Your order is confirmed under {self._customer_name} at {self._customer_address}. Anything else you’d like to add?"
+                )
+                await self._speak_response(done)
+                return True
+
+            if self._is_negative(transcript):
+                self._checkout_phase = CheckoutPhase.EMAIL
+                ask = (
+                    "Oups, d'accord. Pouvez-vous répéter l'email lentement ?"
+                    if language == "fr"
+                    else "Oops—okay. Can you repeat the email slowly?"
+                )
+                await self._speak_response(ask)
+                return True
+
+            reprompt = (
+                "Juste pour vérifier: est-ce que l'email est correct ?"
+                if language == "fr"
+                else "Just to double-check—is that email correct?"
             )
             await self._speak_response(reprompt)
             return True

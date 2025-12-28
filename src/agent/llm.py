@@ -8,10 +8,11 @@ Provides:
 - System prompt configuration
 """
 
-import asyncio
-from typing import AsyncGenerator, List, Dict, Optional, Any
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 import time
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 import structlog
@@ -27,6 +28,7 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 @dataclass
 class LLMResponse:
     """Response from LLM."""
+
     text: str
     first_token_ms: float = 0.0
     total_ms: float = 0.0
@@ -36,6 +38,7 @@ class LLMResponse:
 @dataclass
 class ConversationTurn:
     """A single turn in the conversation."""
+
     role: str  # "user" or "assistant"
     content: str
     timestamp: float = field(default_factory=time.time)
@@ -43,39 +46,30 @@ class ConversationTurn:
 
 class ConversationHistory:
     """Manages conversation history with a rolling window."""
-    
+
     def __init__(self, max_turns: int = 10):
         self.max_turns = max_turns
         self._turns: List[ConversationTurn] = []
-    
+
     def add_user_message(self, content: str) -> None:
-        """Add a user message."""
         self._turns.append(ConversationTurn(role="user", content=content))
         self._trim()
-    
+
     def add_assistant_message(self, content: str) -> None:
-        """Add an assistant message."""
         self._turns.append(ConversationTurn(role="assistant", content=content))
         self._trim()
-    
+
     def _trim(self) -> None:
-        """Trim history to max turns."""
-        # Keep pairs of turns (user + assistant)
         max_messages = self.max_turns * 2
         if len(self._turns) > max_messages:
             self._turns = self._turns[-max_messages:]
-    
+
     def get_messages(self) -> List[Dict[str, str]]:
-        """Get messages in OpenAI format."""
-        return [
-            {"role": turn.role, "content": turn.content}
-            for turn in self._turns
-        ]
-    
+        return [{"role": turn.role, "content": turn.content} for turn in self._turns]
+
     def clear(self) -> None:
-        """Clear conversation history."""
         self._turns.clear()
-    
+
     def __len__(self) -> int:
         return len(self._turns)
 
@@ -83,12 +77,12 @@ class ConversationHistory:
 def get_system_prompt(config: Optional[Any] = None, target_language: str = "en") -> str:
     """
     Get the system prompt for the voice agent.
-    
+
     This defines the agent's persona and behavior guidelines.
     """
     if config is None:
         config = get_config()
-    
+
     language_norm = (target_language or "en").strip().lower()
     is_french = language_norm.startswith("fr")
     target_label = "French" if is_french else "English"
@@ -101,24 +95,29 @@ TARGET_LANGUAGE: {target_label}
 RÈGLES DE LANGUE (OBLIGATOIRES):
 - Réponds uniquement en TARGET_LANGUAGE.
 - Même si l'appelant parle une autre langue, réponds quand même uniquement en TARGET_LANGUAGE.
-- Ne change jamais de langue de toi-même ; seul le système peut mettre à jour TARGET_LANGUAGE.
+- Ne change jamais de langue de toi-même; seul le système peut mettre à jour TARGET_LANGUAGE.
 
 MISSION (MENU UNIQUEMENT):
 - Parle uniquement du menu et de la prise de commande.
-- Si l'appelant demande autre chose (questions générales, horaires, adresse, etc.), redirige poliment vers le menu.
+- Si l'appelant demande autre chose (questions générales, horaires, adresse, etc.), réponds brièvement avec empathie puis ramène doucement au menu.
+- Évite les formulations strictes comme "concentrons-nous sur le menu" ou "je ne peux parler que du menu". Utilise un pivot doux.
 
 PRISE DE COMMANDE:
 - Demande ce que l'appelant veut commander.
 - Pose une seule question à la fois (choix, quantité).
-- Après chaque ajout : confirme brièvement ce que tu as noté, puis demande s'il veut autre chose.
-- Quand l'appelant dit que c'est tout : passe à la confirmation (nom puis adresse).
-- Quand l'appelant donne son nom ou son adresse : confirme en épelant (nom lettre par lettre; pour l'adresse, épelle au moins le numéro et le code postal), puis demande si c'est correct.
-- Une fois confirmé : confirme que la commande est prise et confirmée.
+- Après chaque ajout: confirme brièvement ce que tu as noté, puis demande s'il veut autre chose.
+- Quand l'appelant dit que c'est tout: passe au checkout (nom, adresse, téléphone, email).
+- Quand l'appelant donne son nom: confirme en l'épelant (lettre par lettre), puis demande si c'est correct.
+- Quand l'appelant donne son adresse: confirme en épelant au moins le numéro et le code postal, puis demande si c'est correct.
+- Pour le téléphone: répète les chiffres (ou par groupes) puis demande confirmation.
+- Pour l'email: répète-le lentement; si besoin, demande de l'épeler, puis demande confirmation.
+- Ne confirme la commande (prise/confirmée) qu'après avoir obtenu ET fait confirmer: nom, adresse, téléphone et email.
 
 STYLE:
 - Réponses courtes (souvent 1 à 2 phrases) car c'est de l'audio.
-- Sonner humain: petites réactions naturelles (« Parfait ! », « Super ! ») sans en faire trop.
-- Va droit au but (n'ouvre pas chaque réponse par « Bien sûr ! »).
+- Sonne humain: petites réactions naturelles ("Parfait!", "Super!") sans en faire trop.
+- Ton léger et aidant (pas autoritaire).
+- Va droit au but (n'ouvre pas chaque réponse par "Bien sûr!").
 - N'invente jamais d'articles ou de prix qui ne sont pas dans le menu."""
 
     return f"""You are {config.agent_name}, a cheerful, warm, and professional phone ordering assistant for {config.company_name}.
@@ -132,41 +131,36 @@ LANGUAGE RULES (MANDATORY):
 
 MISSION (MENU ONLY):
 - Only talk about the menu and taking an order.
-- If the caller asks about anything else (general questions, hours, address, etc.), politely redirect back to the menu.
+- If the caller asks about anything else (general questions, hours, address, etc.), respond briefly with empathy, then gently steer back to the menu.
+- Avoid strict wording like "Let's focus on the menu" or "I can only talk about the menu". Use a warm pivot.
 
 ORDER TAKING:
 - Ask what the caller wants to order.
 - Ask one question at a time (choice, quantity).
 - After each item: briefly confirm what you recorded, then ask if they want anything else.
-- When the caller says they are done: move to checkout (name, then address).
-- When the caller gives their name or address: confirm spelling by spelling it back (name letter-by-letter; for address, spell at least the street number and postal code), then ask if it’s correct.
-- Once confirmed: confirm the order is taken and confirmed.
+- When the caller says they are done: move to checkout (name, address, phone number, email).
+- When the caller gives their name: confirm spelling by spelling it back letter-by-letter, then ask if it's correct.
+- When the caller gives their address: confirm by spelling at least the street number and postal code, then ask if it's correct.
+- For phone numbers: repeat digits (or in groups) and ask for confirmation.
+- For emails: repeat slowly; if needed, ask them to spell it, then confirm.
+- Do not confirm the order as taken/confirmed until you have AND confirmed: name, address, phone number, and email.
 
 STYLE:
 - Keep responses short (often 1-2 sentences) because this is spoken audio.
-- Sound human: quick, friendly reactions (“Perfect!”, “Awesome!”) without overdoing it.
-- Start responses directly (no \"Sure!\" / \"Of course!\" openings).
+- Sound human: quick, friendly reactions ("Perfect!", "Awesome!") without overdoing it.
+- Light, helpful tone (never pushy or overly firm).
+- Start responses directly (no "Sure!" / "Of course!" openings).
 - Never invent menu items or prices that aren't in the provided menu."""
 
 
 async def validate_groq_model(api_key: str, model_name: str) -> bool:
     """
     Validate that the configured Groq model exists.
-    
+
     Calls GET https://api.groq.com/openai/v1/models to check.
-    
-    Args:
-        api_key: Groq API key
-        model_name: Model name to validate
-        
-    Returns:
-        True if model exists
-        
-    Raises:
-        SystemExit: If model doesn't exist (fail fast)
     """
     logger.info("Validating Groq model", model=model_name)
-    
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(
@@ -174,7 +168,7 @@ async def validate_groq_model(api_key: str, model_name: str) -> bool:
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=10.0,
             )
-            
+
             if response.status_code != 200:
                 logger.error(
                     "Failed to fetch Groq models",
@@ -185,11 +179,11 @@ async def validate_groq_model(api_key: str, model_name: str) -> bool:
                     f"Failed to validate Groq model. API returned status {response.status_code}. "
                     "Check your GROQ_API_KEY."
                 )
-            
+
             data = response.json()
             models = data.get("data", [])
             model_ids = [m.get("id") for m in models]
-            
+
             if model_name not in model_ids:
                 available = ", ".join(sorted(model_ids)[:10])
                 logger.error(
@@ -202,10 +196,10 @@ async def validate_groq_model(api_key: str, model_name: str) -> bool:
                     f"Available models include: {available}\n"
                     "Please update GROQ_MODEL in your .env file."
                 )
-            
+
             logger.info("Groq model validated successfully", model=model_name)
             return True
-            
+
         except httpx.RequestError as e:
             logger.error("Failed to connect to Groq API", error=str(e))
             raise SystemExit(
@@ -217,34 +211,31 @@ async def validate_groq_model(api_key: str, model_name: str) -> bool:
 class GroqLLM:
     """
     Groq LLM client with streaming support.
-    
+
     Uses OpenAI-compatible API for streaming responses.
     """
-    
+
     def __init__(self, config: Optional[Any] = None):
         if config is None:
             config = get_config()
-        
+
         self.config = config
         self.model = config.groq_model
-        
-        # Use OpenAI client with Groq base URL
+
         self._client = AsyncOpenAI(
             api_key=config.groq_api_key,
             base_url=GROQ_BASE_URL,
         )
-        
+
         self._history = ConversationHistory(max_turns=config.max_history_turns)
-    
+
     @property
     def history(self) -> ConversationHistory:
-        """Get conversation history."""
         return self._history
-    
+
     async def validate_model(self) -> bool:
-        """Validate the configured model exists."""
         return await validate_groq_model(self.config.groq_api_key, self.model)
-    
+
     async def generate_streaming(
         self,
         user_message: str,
@@ -254,61 +245,58 @@ class GroqLLM:
     ) -> AsyncGenerator[str, None]:
         """
         Generate a streaming response.
-        
+
         Args:
             user_message: The user's message
+            target_language: "en" or "fr" (or a locale starting with these)
             include_history: Whether to include conversation history
             extra_context: Optional extra system context (e.g., menu/rules)
-            
+
         Yields:
             Text chunks as they're generated
         """
         system_prompt = get_system_prompt(self.config, target_language=target_language or "en")
 
-        # Build messages
-        messages = [{"role": "system", "content": system_prompt}]
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         if extra_context:
             messages.append({"role": "system", "content": extra_context})
-        
+
         if include_history:
             messages.extend(self._history.get_messages())
-        
+
         messages.append({"role": "user", "content": user_message})
-        
-        # Add user message to history
         self._history.add_user_message(user_message)
-        
+
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 stream=True,
-                max_tokens=256,  # Keep responses short for voice
+                max_tokens=256,
                 temperature=0.7,
             )
-            
+
             full_response = ""
-            
+
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
                     text = chunk.choices[0].delta.content
                     full_response += text
                     yield text
-            
-            # Add assistant response to history
+
             self._history.add_assistant_message(full_response)
-            
+
         except Exception as e:
             logger.error("LLM generation failed", error=str(e))
             language_norm = (target_language or "en").strip().lower()
             error_msg = (
-                "Désolé, j'ai un problème technique en ce moment. Pouvez-vous répéter ?"
+                "Désolé, j'ai un petit souci technique en ce moment. Vous pouvez répéter ?"
                 if language_norm.startswith("fr")
                 else "I'm sorry, I'm having trouble right now. Could you please repeat that?"
             )
             self._history.add_assistant_message(error_msg)
             yield error_msg
-    
+
     async def generate(
         self,
         user_message: str,
@@ -316,23 +304,12 @@ class GroqLLM:
         include_history: bool = True,
         extra_context: Optional[str] = None,
     ) -> LLMResponse:
-        """
-        Generate a complete response (non-streaming).
-        
-        Args:
-            user_message: The user's message
-            include_history: Whether to include conversation history
-            extra_context: Optional extra system context (e.g., menu/rules)
-            
-        Returns:
-            LLMResponse with full text and timing
-        """
         start_time = time.time()
-        first_token_time = None
-        
+        first_token_time: Optional[float] = None
+
         full_text = ""
         token_count = 0
-        
+
         async for chunk in self.generate_streaming(
             user_message,
             target_language=target_language,
@@ -343,46 +320,35 @@ class GroqLLM:
                 first_token_time = time.time()
             full_text += chunk
             token_count += 1
-        
+
         end_time = time.time()
-        
+
         return LLMResponse(
             text=full_text,
             first_token_ms=(first_token_time - start_time) * 1000 if first_token_time else 0,
             total_ms=(end_time - start_time) * 1000,
             tokens_generated=token_count,
         )
-    
+
     def clear_history(self) -> None:
-        """Clear conversation history."""
         self._history.clear()
-    
+
     def get_history_messages(self) -> List[Dict[str, str]]:
-        """Get conversation history as list of messages."""
         return self._history.get_messages()
 
 
-# Singleton instance
 _llm_instance: Optional[GroqLLM] = None
 
 
 def get_llm() -> GroqLLM:
-    """Get or create the LLM singleton."""
     global _llm_instance
-    
     if _llm_instance is None:
         _llm_instance = GroqLLM()
-    
     return _llm_instance
 
 
 async def initialize_llm() -> GroqLLM:
-    """
-    Initialize and validate the LLM at startup.
-    
-    Returns:
-        Initialized and validated GroqLLM instance
-    """
     llm = get_llm()
     await llm.validate_model()
     return llm
+
