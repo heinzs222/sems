@@ -458,7 +458,7 @@ class VoicePipeline:
         # NOTE: Deepgram's `speech_final` may not always be present / true depending
         # on model + endpointing mode. Requiring it can lead to "greets but never
         # responds" if we only ever receive `is_final=true` segments.
-        if result.is_final:
+        if result.is_final or result.speech_final:
             transcript = result.text.strip()
             
             if not transcript:
