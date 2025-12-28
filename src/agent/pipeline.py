@@ -453,8 +453,12 @@ class VoicePipeline:
                 await self._handle_interruption()
                 self._pending_transcript = result.text
         
-        # Process final transcripts
-        if result.is_final and result.speech_final:
+        # Process final transcripts.
+        #
+        # NOTE: Deepgram's `speech_final` may not always be present / true depending
+        # on model + endpointing mode. Requiring it can lead to "greets but never
+        # responds" if we only ever receive `is_final=true` segments.
+        if result.is_final:
             transcript = result.text.strip()
             
             if not transcript:
@@ -465,7 +469,11 @@ class VoicePipeline:
                 transcript = self._pending_transcript
                 self._pending_transcript = ""
             
-            logger.info("Final transcript", text=transcript[:100])
+            logger.info(
+                "Final transcript",
+                text=transcript[:100],
+                speech_final=result.speech_final,
+            )
             await self._turn_queue.put(
                 QueuedTranscript(
                     text=transcript,
