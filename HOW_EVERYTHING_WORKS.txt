@@ -1,27 +1,103 @@
-﻿================================================================================
-TWILIO VOICE AGENT - HOW EVERYTHING WORKS (Repository Walkthrough)
 ================================================================================
-Generated: 2025-12-27
-Repository: c:\Users\hatem\Desktop\sems-main
+TWILIO VOICE AGENT - HOW EVERYTHING WORKS (Code-Accurate Walkthrough)
+================================================================================
+Generated: 2025-12-28
+Code snapshot: git 8acf5fa (main)
+Repository path: C:\Users\hatem\Desktop\sems-main
+  (This repo may also live at C:\Users\hatem\OneDrive\Desktop\sems-main; Desktop can be a junction.)
 
-This is a Python/FastAPI service that turns a Twilio phone call into a live,
-two-way conversation with an AI agent:
+This is a Python/FastAPI service that turns a Twilio PSTN/SIP call into a live,
+two-way, bilingual (EN↔FR) menu-ordering conversation:
 
 - Inbound audio: caller -> Twilio Media Streams -> your WebSocket (/ws)
-- Speech-to-text: Deepgram streaming (mulaw @ 8 kHz)
-- Response generation: Groq LLM (OpenAI-compatible API)
-- Text-to-speech: Cartesia streaming (PCM S16LE @ 8 kHz)
+- Speech-to-text (STT): Deepgram streaming (mu-law @ 8 kHz)
+- Language: per-call auto EN↔FR stabilization + explicit overrides
+- Response generation: LLM (Groq by default; optional OpenAI/ChatGPT)
+- Text-to-speech (TTS): Cartesia streaming (PCM S16LE @ 8 kHz -> mu-law @ 8 kHz)
 - Outbound audio: server -> Twilio Media Streams -> caller
+- Barge-in: two-stage interruption with Twilio `clear`, Twilio `mark`, and Cartesia cancel
 
-This document is code-accurate for the repository contents as of the date above.
-It intentionally avoids including any real secrets from .env.
-If you need the operational "how to run it" guide, also see:
-- README.md
-- HOWTO.txt
-- SECURITY.md
+This document is intentionally detailed and code-accurate for the current repo.
+It does NOT include any real secrets from .env.
+If you want the shorter operational guide, see README.md / HOWTO.txt / SECURITY.md.
 
 ================================================================================
-1) Repository Layout (what each folder is)
+0) Versions, “latest tech”, and dependency snapshot
+================================================================================
+
+Python runtime
+--------------
+- Repo requirement: Python 3.10+ (see requirements.txt).
+- Deployment containers commonly run Python 3.12.x (your Railway logs show python3.12).
+- Local dev/tests may run a different Python (your local pytest output showed Python 3.11.9).
+
+Pinned vs unpinned dependencies
+-------------------------------
+requirements.txt pins a few performance-critical packages; most are “latest at install time”:
+- granian==1.6.3 (ASGI server used in production)
+- uvloop==0.21.0 (Linux only; Windows falls back to default asyncio loop)
+- msgspec==0.18.6 (fast JSON decode/encode for Twilio WS messages)
+- orjson==3.10.11 (FastAPI JSON responses)
+
+Dependency lock note (IMPORTANT for "exact versions")
+-----------------------------------------------------
+- This repo does NOT ship a lock file (no poetry.lock / requirements.lock / pip-tools lock).
+  That means many package versions are resolved at install/build time and can drift.
+- To see the *exact* installed versions in a given environment, run:
+  - python -m pip freeze
+  - python -m pip show fastapi granian deepgram-sdk cartesia openai groq twilio websockets
+
+requirements.txt (exact contents)
+---------------------------------
+See requirements.txt in the repo root. As of this code snapshot it contains:
+- fastapi
+- granian==1.6.3
+- uvloop==0.21.0; platform_system != "Windows"
+- msgspec==0.18.6
+- orjson==3.10.11
+- uvicorn[standard]
+- websockets
+- python-dotenv
+- httpx
+- twilio
+- deepgram-sdk
+- cartesia
+- openai
+- groq
+- instructor
+- pydantic
+- semantic-router[fastembed]
+- fastembed
+- aiofiles
+- structlog
+- pytest
+- pytest-asyncio
+
+Key service integrations (external “versions” / protocols)
+----------------------------------------------------------
+- Twilio Media Streams:
+  - Audio format: G.711 μ-law (PCMU), 8 kHz, 20 ms frames (160 bytes)
+  - WebSocket events: connected/start/media/mark/dtmf/stop
+  - Control messages: `mark` (playback ack), `clear` (flush queued audio for barge-in)
+
+- Deepgram STT:
+  - Model: nova-3 (kept “latest”; we do NOT downgrade the model)
+  - Endpoint preference: /v2/listen (Flux) when supported by the Deepgram account
+  - Fallback: /v1/listen when /v2 returns HTTP 400
+  - Language: uses `language=multi` (English/French code-switching), not `language=en|fr`
+    (Some accounts reject nova-3 with detect_language=true/Flux; this repo stays on nova-3 and
+     handles language switching in-app.)
+
+- Cartesia TTS:
+  - WebSocket API version: 2024-06-10 (see CARTESIA_API_VERSION in src/agent/tts.py)
+  - Output requested: raw PCM S16LE @ 8000 Hz (no resampling), converted to mu-law for Twilio
+
+- LLM provider:
+  - Default: Groq via OpenAI-compatible API (base_url https://api.groq.com/openai/v1)
+  - Optional: OpenAI/ChatGPT (https://api.openai.com/v1) by setting LLM_PROVIDER=openai
+
+================================================================================
+1) Repository layout (what each folder/file does)
 ================================================================================
 
 Top-level (important first-party files):
@@ -32,84 +108,209 @@ Top-level (important first-party files):
   - config.py
     Loads .env and exposes a validated Config object.
   - pipeline.py
-    The per-call orchestrator (Twilio <-> STT <-> LLM <-> TTS).
+    Per-call orchestrator: Twilio <-> STT <-> language <-> (checkout or LLM) <-> TTS <-> Twilio.
+    Contains the “menu-only checkout” deterministic flow and best-in-class barge-in.
   - twilio_protocol.py
     Parses/creates Twilio Media Streams JSON messages.
+    Tracks mark RTT + playback_generation_id to ignore stale marks after `clear`.
+  - audio.py
+    μ-law/PCM conversion + Twilio frame sizing constants (20 ms = 160 bytes).
+    Defines Flux 80 ms chunk size (640 bytes at 8 kHz μ-law) used when STT uses Deepgram v2.
   - stt.py
-    Deepgram streaming STT client (WebSocket).
+    Deepgram streaming STT client (raw WebSocket, Nova-3, v2->v1 fallback).
+  - language.py
+    Explicit language overrides + per-call stabilization rules (avoid “flapping”).
+  - menu.py
+    Loads menu.html and extracts sections + items + prices (deterministic, no hallucinations).
   - llm.py
-    Groq LLM wrapper (OpenAI-compatible) + conversation history.
+    Streaming chat completion wrapper using the OpenAI SDK.
+    Provider can be Groq (default) or OpenAI (ChatGPT) based on env.
+    Per-call conversation history (no cross-call mixing).
   - tts.py
-    Cartesia streaming TTS client (WebSocket).
+    Cartesia streaming TTS client (WebSocket), with context cancel support.
   - routing.py
-    Optional semantic router + cached audio playback.
+    Optional semantic router + cached audio playback (disabled in menu-only mode).
   - extract.py
-    Optional structured extraction (background task).
-- assets/audio/
-  - *.mulaw
-    Cached responses (raw G.711 mu-law 8 kHz, no headers).
-  - source/
-    Place WAV sources here if you want to build new cached audio.
-- scripts/
-  - start.sh
-    Production start command (Granian ASGI server).
-  - build_audio.sh / build_audio.py
-    Convert WAV -> .mulaw for cached audio.
-  - smoke_test.py
-    Verifies env vars + dependencies + Groq model exists.
-- tests/
-  Pytest suite for protocol, TwiML, audio utilities, routing.
+    Optional structured extraction (background task queue).
 
-Large / non-code / local artifacts in this repo:
-- .venv/
-  Local Python virtual environment (third-party code).
-- ffmpeg-master-latest-win64-gpl-shared/
-  A full Windows ffmpeg distribution (very large; upstream files).
-- flyctl.exe + wintun.dll
-  Fly.io CLI and Wintun driver (used for Fly deployments on Windows).
-- .tmp_granian/
-  Runtime/temp directory for the Granian server.
+Top-level data:
+- menu.html
+  Menu source HTML (UberEats-style export). Parsed at runtime by src/agent/menu.py.
+- menu_items.json
+  A derived artifact produced by scripts/extract_menu_items.py (not required at runtime).
+
+Scripts:
+- scripts/start.sh
+  Production entrypoint (Granian ASGI server).
+- scripts/build_audio.sh
+  Convert WAV -> .mulaw cached audio using ffmpeg.
+- scripts/extract_menu_items.py
+  Extract menu items/prices from menu.html and write menu_items.json (offline helper).
+- scripts/language_switch_harness.py
+  Quick deterministic language-switch assertions for LangState rules.
+- scripts/smoke_test.py
+  Environment/dependency sanity checks.
+
+Tests:
+- tests/
+  Pytest suite for protocol, TwiML, audio utilities, menu parsing, language rules, STT Flux batching, etc.
+
+Large/local artifacts (not part of runtime application logic):
+- ffmpeg-master-latest-win64-gpl-shared/ (very large; local ffmpeg distribution)
+- run.bat (local convenience; not required in prod)
+- .venv/ (local virtualenv)
+- flyctl.exe + wintun.dll (deployment tooling)
 
 ================================================================================
 2) Configuration (.env) and what it affects
 ================================================================================
 
-Configuration is loaded by src/agent/config.py via python-dotenv (load_dotenv()).
-The strongly-typed Config object is cached (lru_cache), so changes to environment
-variables require restarting the process.
+Config loading rules
+--------------------
+- src/agent/config.py uses python-dotenv (load_dotenv()).
+- get_config() is lru_cached, so changing env vars requires restarting the process.
 
-Required variables (see .env.example):
+Core required variables
+-----------------------
 - PUBLIC_HOST
-  Public hostname used to build Twilio URLs (NO "https://", just host).
-  Example: abc123.ngrok-free.app
+  Public hostname for Twilio to reach you (NO scheme).
+  Example: sems-production-xxxx.up.railway.app
+
 - TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN
-  Used for optional REST API actions (hangup) and config validation.
+  Used for optional REST actions (hangup) and startup validation.
+
 - DEEPGRAM_API_KEY
-  Used by Deepgram STT WebSocket Authorization header.
-- CARTESIA_API_KEY (+ optional CARTESIA_VOICE_ID)
-  Used by Cartesia TTS WebSocket.
-- GROQ_API_KEY / GROQ_MODEL
-  Used by the Groq LLM and by extraction.
+  Used to authorize Deepgram STT WebSocket.
 
-Behavior / feature flags:
-- ROUTER_ENABLED (default true)
-  Enables semantic routing + cached audio responses (routing.py).
-- OUTLINES_ENABLED (default false)
-  Enables outlines-based extraction (extract.py; not fully implemented).
+- CARTESIA_API_KEY
+  Used to authorize Cartesia TTS WebSocket.
+
+LLM selection (Groq by default, optional ChatGPT)
+-------------------------------------------------
+Set ONE of these providers:
+
+Option A) Groq (default)
+  - LLM_PROVIDER=groq
+  - GROQ_API_KEY
+  - GROQ_MODEL (example: llama-3.3-70b-versatile)
+
+Option B) OpenAI / ChatGPT
+  - LLM_PROVIDER=openai
+  - OPENAI_API_KEY
+  - OPENAI_MODEL (example: gpt-4.1, gpt-4o, gpt-4o-mini)
+
+At startup, server/app.py calls initialize_llm() which validates the model exists by calling
+GET /models on the chosen provider.
+
+Deepgram Flux (v2) tuning + forcing v1
+--------------------------------------
+- DEEPGRAM_EAGER_EOT_THRESHOLD (default 0.38)
+- DEEPGRAM_EOT_THRESHOLD (default 0.74)
+- DEEPGRAM_EOT_TIMEOUT_MS (default 6500)
+  These are used only if your Deepgram account accepts /v2/listen.
+
+- USE_DEEPGRAM_V1_ONLY=true
+  Forces /v1/listen only (skips trying /v2/listen).
+
+Language + voice configuration
+------------------------------
+- DEFAULT_LANGUAGE=en|fr
+  Starting language at call start. Auto-switch can still occur per utterance.
+
+- CARTESIA_VOICE_ID (English/default voice)
+- CARTESIA_VOICE_ID_FR (French voice)
+
+Feature flags / behavior
+------------------------
+- MENU_ONLY=true|false
+  When true: agent only discusses the menu + simulated ordering.
+  Router is bypassed and the menu is injected into every LLM turn.
+
+- ROUTER_ENABLED=true|false
+  Enables semantic routing + cached audio (only used when MENU_ONLY=false).
+
 - MAX_HISTORY_TURNS (default 10)
-  Controls how much chat history is sent to the LLM.
+  Conversation history window size sent to the LLM.
+
 - SILENCE_TIMEOUT_SECONDS (default 1.5)
-  Base silence timeout used by the pipeline's silence detector.
+  Used by a basic “are you still there?” silence detector.
+  Note: this is based on inbound media timing, not semantic “speech”.
+
 - MIN_INTERRUPTION_WORDS (default 3)
-  Barge-in threshold: how many words before an interruption triggers.
+  Barge-in word threshold (hard interrupt) when the agent is speaking.
 
-Additional (not in .env.example but supported in code):
-- USE_DEEPGRAM_FLUX (default false)
-  When true, stt.py uses Deepgram v2 endpoint configuration.
+Complete environment variable reference (names + defaults)
+----------------------------------------------------------
+This is the canonical list of env vars read by the current code (src/agent/config.py plus a few
+feature flags read directly in other modules).
 
-Security note:
-- Do not commit .env.
-- Avoid logging secrets; this repo masks sensitive values in logs and scripts.
+Server + logging
+----------------
+- PUBLIC_HOST (required)
+  Public hostname (no scheme). Used for Twilio TwiML and WS URL.
+- PORT (default 7860)
+  What the HTTP server binds to. Railway injects PORT automatically.
+- HOST (default 0.0.0.0)
+  Used by scripts/start.sh only (Granian bind host).
+- LOG_LEVEL (default INFO)
+  Controls structlog verbosity.
+
+Agent identity / branding
+-------------------------
+- AGENT_NAME (default "Sesame")
+- COMPANY_NAME (default "Sesame AI")
+
+Language (call start)
+---------------------
+- DEFAULT_LANGUAGE (default "en")
+  If it starts with "fr", it is treated as French; otherwise English. Auto-switch can still occur.
+
+Twilio
+------
+- TWILIO_ACCOUNT_SID (required)
+- TWILIO_AUTH_TOKEN (required)
+
+Deepgram STT
+------------
+- DEEPGRAM_API_KEY (required)
+- USE_DEEPGRAM_V1_ONLY (default false)
+  Skips trying /v2/listen (Flux) and goes straight to /v1/listen.
+- DEEPGRAM_EAGER_EOT_THRESHOLD (default 0.38)
+- DEEPGRAM_EOT_THRESHOLD (default 0.74)
+- DEEPGRAM_EOT_TIMEOUT_MS (default 6500)
+  Used only when /v2/listen is active.
+- DEEPGRAM_LANGUAGE_EN (default "en-US")
+- DEEPGRAM_LANGUAGE_FR (default "fr")
+  NOTE: The current STT connection uses language=multi, so these are not passed as query params.
+
+Cartesia TTS
+------------
+- CARTESIA_API_KEY (required)
+- CARTESIA_VOICE_ID (default English voice id)
+- CARTESIA_VOICE_ID_FR (default French voice id)
+
+LLM provider (Groq by default, optional OpenAI/ChatGPT)
+-------------------------------------------------------
+- LLM_PROVIDER (default "groq")  # "groq" or "openai"
+Groq:
+  - GROQ_API_KEY (required when LLM_PROVIDER=groq)
+  - GROQ_MODEL (default "llama-3.3-70b-versatile")
+OpenAI:
+  - OPENAI_API_KEY (required when LLM_PROVIDER=openai)
+  - OPENAI_MODEL (default "gpt-4o-mini")
+
+Feature flags
+-------------
+- MENU_ONLY (default true)
+- ROUTER_ENABLED (default true)
+- MEMORY_ENABLED (default false)
+- OUTLINES_ENABLED (default false)
+
+Conversation + turn-taking knobs
+--------------------------------
+- MAX_HISTORY_TURNS (default 10)
+- SILENCE_TIMEOUT_SECONDS (default 1.5)
+- MIN_INTERRUPTION_WORDS (default 3)
 
 ================================================================================
 3) High-level runtime flow (from phone call to spoken response)
@@ -117,78 +318,79 @@ Security note:
 
 A) Twilio call setup
 --------------------
-1. A call arrives on your Twilio number / SIP endpoint.
-2. Twilio requests TwiML from your server (either):
-   - POST/GET /incoming-call  (alias of /twiml)
-   - POST/GET /twiml
-3. server/app.py returns TwiML:
+1) A call arrives on your Twilio number / SIP endpoint.
+2) Twilio requests TwiML from your server:
+   - GET/POST /twiml
+   - GET/POST /incoming-call (alias)
+3) server/app.py returns:
    <Response>
      <Connect>
-       <Stream url="wss://{PUBLIC_HOST}/ws" />
+       <Stream
+         url="wss://{PUBLIC_HOST}/ws"
+         statusCallback="https://{PUBLIC_HOST}/stream-status"
+         statusCallbackMethod="POST"
+       />
      </Connect>
    </Response>
-4. Twilio opens a WebSocket to wss://{PUBLIC_HOST}/ws and starts streaming audio.
+4) Twilio opens a WebSocket to wss://{PUBLIC_HOST}/ws and begins streaming.
+   Twilio may request WebSocket subprotocol “twilio”; server/app.py accepts it when present.
 
 B) Media stream loop
 --------------------
-Twilio sends JSON messages over the WebSocket (twilio_protocol.py):
-- connected: initial handshake
-- start: provides streamSid + callSid (important)
-- media: base64-encoded mu-law 8 kHz audio frames (20 ms = 160 bytes)
-- mark: acknowledgement of a previous mark message
-- dtmf: keypress events
-- stop: stream closed (call ended)
+Inbound Twilio -> your server:
+- connected: handshake
+- start: streamSid + callSid (critical)
+- media: base64 μ-law 8 kHz (160 bytes per 20 ms)
+- mark: ack for previously sent marks
+- dtmf: keypress
+- stop: stream closed
 
-Your server replies with:
-- media: audio back to the caller (base64 mu-law 8 kHz)
-- mark: request Twilio acknowledgement ("this audio finished playing")
-- clear: flush Twilio's buffered audio (used for barge-in)
+Outbound your server -> Twilio:
+- media: base64 μ-law 8 kHz frames
+- mark: sentence-level playback markers
+- clear: flush Twilio buffered audio on barge-in (hard interrupt)
 
-C) Voice pipeline
------------------
-For each WebSocket call, server/app.py creates one VoicePipeline
-(src/agent/pipeline.py). That pipeline owns:
+C) Per-call pipeline
+--------------------
+For each WebSocket call, server/app.py creates one VoicePipeline (src/agent/pipeline.py).
+The pipeline owns:
+- TwilioProtocolHandler (twilio_protocol.py)
+- STTManager/DeepgramSTT (stt.py)
+- LangState + override detection (language.py)
+- MenuCatalog (menu.py; menu.html parsed into items/prices)
+- LLM client (llm.py; per-call history; Groq or OpenAI)
+- TTSManager/CartesiaTTS (tts.py)
+- Audio pacer (20 ms frame timing + prebuffer)
+- Two-stage barge-in (soft pause -> hard clear/cancel)
 
-- TwilioProtocolHandler: call state and message helpers
-- STTManager/DeepgramSTT: Deepgram streaming STT
-- GroqLLM: streaming chat completion
-- TTSManager/CartesiaTTS: Cartesia streaming TTS
-- (optional) SemanticRouter: quick cached responses
-- (optional) ExtractionQueue: background structured extraction
-
-The core loop is:
-
-Twilio media -> STT -> (final transcript) -> (router or LLM) -> TTS -> Twilio media
+Core loop:
+Twilio media -> STT -> (final transcript) -> (checkout OR LLM) -> TTS -> pacer -> Twilio media
 
 ================================================================================
 4) Server entrypoint: server/app.py
 ================================================================================
 
-FastAPI app
------------
-- Lifespan startup (lifespan()):
-  - init_config() validates required env vars.
-  - configure_logging() sets structlog (JSON logs by default).
-  - initialize_llm() validates that GROQ_MODEL exists (calls Groq /models).
-  - initialize_router() warms the routing model if enabled.
+Startup (lifespan)
+------------------
+- init_config() validates env and logs a sanitized “Configuration loaded” record.
+- initialize_llm() validates your chosen provider model exists (/models call).
+- initialize_router() warms router if ROUTER_ENABLED=true (even if MENU_ONLY=true, pipeline bypasses it).
 
 Endpoints
 ---------
 - GET /health
-  Returns {"status":"healthy", ...}
+  Simple health response + active call count.
 - GET /metrics
-  Returns server-wide connection/call counters.
+  Server-wide counters (connections/calls/errors).
 - GET/POST /twiml and /incoming-call
-  Returns TwiML that points Twilio at wss://{PUBLIC_HOST}/ws
+  Returns TwiML with <Connect><Stream> to /ws + statusCallback to /stream-status.
+- GET/POST /stream-status
+  Logs Twilio status callbacks; essential for debugging “hang up instantly”.
 - WS /ws
-  Accepts Twilio Media Streams WebSocket and forwards messages to VoicePipeline.
-
-WebSocket handling pattern
---------------------------
-- Accept the socket
-- Create pipeline: create_pipeline(send_message)
-- Loop: receive_text() -> pipeline.handle_message(raw_json)
-- On disconnect/stop/error: pipeline.stop()
+  Twilio Media Streams endpoint. Accepts optional “twilio” subprotocol, then:
+  - create_pipeline(send_message)
+  - loop receive_text -> pipeline.handle_message(raw_json)
+  - on disconnect/stop: pipeline.stop()
 
 ================================================================================
 5) Twilio protocol layer: src/agent/twilio_protocol.py
@@ -196,317 +398,480 @@ WebSocket handling pattern
 
 Parsing inbound messages
 ------------------------
-parse_twilio_message(raw_json) returns (TwilioEventType, parsed_event)
-
+parse_twilio_message(raw_json) returns (TwilioEventType, parsed_event) using msgspec.
 Important parsed dataclasses:
 - TwilioStartEvent: stream_sid, call_sid, account_sid, tracks, custom_parameters
-- TwilioMediaEvent: stream_sid, track, chunk, timestamp, payload (decoded bytes)
-- TwilioMarkEvent: stream_sid, name
-- TwilioDTMFEvent: stream_sid, digit
+- TwilioMediaEvent: payload (decoded μ-law bytes)
+- TwilioMarkEvent: name
+- TwilioDTMFEvent: digit
 
 Creating outbound messages
 --------------------------
-- create_media_message(streamSid, audio_bytes)
-  Encodes audio_bytes (mu-law) as base64 and wraps in {"event":"media",...}
+- create_media_message(streamSid, ulaw_bytes)
 - create_mark_message(streamSid, name)
 - create_clear_message(streamSid)
 
-Call state tracking
--------------------
-TwilioProtocolHandler holds a CallState:
-- stream_sid / call_sid
-- pending_marks: mark_name -> send_time
-- mark RTT samples (ms)
+Marks + playback generation (critical for “clean barge-in”)
+----------------------------------------------------------
+TwilioProtocolHandler maintains CallState:
+- playback_generation_id (starts at 0)
+- mark_sequence counter
+- pending_marks[name] = send_time (for RTT)
+- mark RTT samples -> avg_mark_rtt_ms
 
-Marks are useful for:
-- measuring playback latency (server -> Twilio -> ack)
-- coordinating "stop speaking" logic (this repo tracks RTT; it does not block on it)
+Auto-generated mark names:
+- g{playback_generation_id}_m{mark_sequence}
+  Example: g0_m1, g0_m2, ...
+
+After a `clear`, pipeline bumps playback_generation_id and any later mark acks from the previous
+generation are ignored (prevents “stale mark” confusion).
 
 ================================================================================
 6) Audio formats + utilities: src/agent/audio.py
 ================================================================================
 
-Telephone/Twilio audio facts
-----------------------------
-Twilio Media Streams uses G.711 mu-law:
-- sample_rate: 8000 Hz
-- 1 byte per sample
-- typical frame: 20 ms = 160 bytes
+Twilio PSTN audio facts
+-----------------------
+- G.711 μ-law (PCMU), 8 kHz, 1 byte/sample
+- 20 ms frame = 160 bytes (TWILIO_FRAME_SIZE)
 
-This repo's chosen "late-2025 best practice"
---------------------------------------------
-- Send Twilio mu-law 8 kHz DIRECTLY to Deepgram:
-  - No decode to PCM
-  - No resampling to 16 kHz
-- Request 8 kHz PCM directly from Cartesia to avoid resampling.
+Deepgram STT path (no-resample best practice)
+---------------------------------------------
+- Send Twilio μ-law bytes directly to Deepgram with encoding=mulaw&sample_rate=8000.
+- If Deepgram v2/Flux is active, batch into ~80 ms chunks (FLUX_FRAME_SIZE = 640 bytes).
 
-Utilities provided
-------------------
-- ulaw_to_linear16 / linear16_to_ulaw
-  Convert between mu-law and PCM S16.
-- resample_* helpers
-  Fast resampling using audioop.ratecv (kept for compatibility/tests).
-- twilio_ulaw_passthrough()
-  Current pipeline path: returns ulaw bytes unchanged for STT.
-- chunk_audio()
-  Splits audio into fixed-size frames and pads the last frame with 0xFF (silence).
+Cartesia TTS path (no-resample best practice)
+---------------------------------------------
+- Request PCM S16LE @ 8000 Hz from Cartesia (no resampling).
+- Convert PCM->μ-law using audioop.lin2ulaw (fast).
 
-Note:
-- Some legacy utility functions in audio.py reference numpy (np) but numpy is not
-  imported there. Those paths are not used by the live pipeline.
+Important note (unused legacy path)
+-----------------------------------
+tts_pcm_to_twilio_ulaw() has a float32 conversion path that references numpy (np) but numpy is not
+imported in audio.py. The live pipeline uses pcm_8k_to_ulaw() and does not hit that float32 path.
 
 ================================================================================
 7) Speech-to-text (Deepgram): src/agent/stt.py
 ================================================================================
 
-Connection
-----------
-DeepgramSTT.connect() opens a WebSocket to:
-- wss://api.deepgram.com/v1/listen (default)
-- wss://api.deepgram.com/v2/listen (if USE_DEEPGRAM_FLUX=true)
+Connection strategy (Nova-3, prefer v2/Flux, fallback to v1)
+-----------------------------------------------------------
+DeepgramSTT.connect():
+- Always uses model=nova-3 (no “older model fallback”).
+- Builds candidate URLs:
+  1) v2_nova-3_multi (wss://api.deepgram.com/v2/listen) unless:
+     - USE_DEEPGRAM_V1_ONLY=true, or
+     - a previous v2 attempt failed with HTTP 400 (cached per process).
+  2) v1_nova-3_multi (wss://api.deepgram.com/v1/listen) fallback.
 
-Key parameters used:
+If v2 returns HTTP 400, stt.py logs “Deepgram v2 disabled (HTTP 400)” and stops trying it for
+the lifetime of that process (avoids slow retries on every call).
+
+Query params (current)
+----------------------
+Common:
+- model=nova-3
 - encoding=mulaw
 - sample_rate=8000
+- channels=1
+- punctuate=true
 - interim_results=true
 - smart_format=true
-- endpointing=500 (v1 mode)
+- vad_events=true
+- language=multi
+
+v1-only extras:
+- endpointing=300
+
+v2/Flux extras:
+- eager_eot_threshold={DEEPGRAM_EAGER_EOT_THRESHOLD}
+- eot_threshold={DEEPGRAM_EOT_THRESHOLD}
+- eot_timeout_ms={DEEPGRAM_EOT_TIMEOUT_MS}
 
 Audio sending
 -------------
-send_audio(audio_bytes) sends raw bytes over the WebSocket.
-In the current architecture, audio_bytes are Twilio's mu-law 8 kHz bytes.
+- v2/Flux: batches to ~80 ms chunks (640 bytes) before ws.send()
+- v1: sends μ-law bytes as they arrive from Twilio
 
-Receiving transcripts
----------------------
-Deepgram returns JSON messages. stt.py handles:
-- type == "Results"
-  Contains transcript + confidence + is_final + speech_final
-- type == "UtteranceEnd"
-  Used as an explicit "turn ended" signal.
+Receiving transcripts + events
+------------------------------
+stt.py handles (best effort):
+- type=Results: transcript, confidence, is_final, speech_final
+- type=SpeechStarted: used for barge-in soft interrupt
+- type=UtteranceEnd: end-of-turn hint
+- type=EagerEndOfTurn / TurnResumed: Flux turn-taking signals (logged as debug)
 
-stt.py calls the pipeline callback with TranscriptionResult objects.
+Language detection fields
+-------------------------
+Deepgram may (or may not) include:
+- detected_language
+- language_confidence
+stt.py extracts these when present and passes them through TranscriptionResult.
 
 ================================================================================
-8) LLM (Groq): src/agent/llm.py
+8) Language switching (EN↔FR): src/agent/language.py + pipeline integration
 ================================================================================
 
-Startup model validation
-------------------------
-validate_groq_model() calls:
-GET https://api.groq.com/openai/v1/models
-and fails fast if GROQ_MODEL is not present.
+Source of truth per utterance
+-----------------------------
+pipeline.py chooses language per “final transcript” using:
+1) Explicit override phrases (always win)
+2) Deepgram-provided detected_language/language_confidence (when present)
+3) Fallback: infer_language_from_text() (lightweight text heuristic)
 
-Runtime generation
+Stabilization rules (LangState)
+-------------------------------
+To prevent language “flapping” on short utterances:
+- confidence threshold: 0.75
+- require 2 consecutive eligible final transcripts to switch
+- ignore very short transcripts (<12 chars)
+- hold time: 20 seconds after a switch (won’t switch back immediately)
+
+Explicit overrides (instant)
+----------------------------
+French:
+- “parle français”
+- “en français”
+- “français s’il te plaît”
+English:
+- “speak English”
+- “in English please”
+- “English please”
+
+Structured log emitted each turn
+-------------------------------
+pipeline logs “Language decision” with:
+- detected_language
+- language_confidence
+- current_language
+- switched (bool)
+- reason (override/stabilized/None)
+- detection_source (deepgram/text)
+
+How this drives LLM + TTS
+-------------------------
+- LLM system prompt includes TARGET_LANGUAGE and requires replies only in that language.
+- TTS voice_id switches between CARTESIA_VOICE_ID (EN) and CARTESIA_VOICE_ID_FR (FR).
+
+================================================================================
+9) Menu parsing and “menu-only” behavior: menu.html + src/agent/menu.py
+================================================================================
+
+Menu source
+-----------
+menu.html is parsed at runtime to build a deterministic MenuCatalog:
+- Section titles: div[data-testid="catalog-section-title"] -> h3 text
+- Items: li[data-testid^="store-item-"]
+- Item fields: span[data-testid="rich-text"]
+  - first rich-text span: name
+  - first rich-text span starting with “$”: price
+
+Caching + logs
+--------------
+get_menu_catalog() is lru_cached; it logs “Menu loaded” with num_items/num_sections.
+
+How the menu is provided to the LLM
+-----------------------------------
+In MENU_ONLY=true mode:
+- pipeline._build_extra_context() ALWAYS injects:
+  - deterministic “MENU CONTEXT / CONTEXTE MENU” rules
+  - the full menu listing from MenuCatalog.to_prompt_lines()
+
+This is what prevents the agent from hallucinating items/prices.
+
+================================================================================
+10) LLM layer: src/agent/llm.py (Groq or OpenAI/ChatGPT)
+================================================================================
+
+Provider selection
 ------------------
-GroqLLM uses the OpenAI SDK pointed at Groq's base_url.
-generate_streaming(user_message) yields incremental text chunks.
-ConversationHistory stores recent turns (rolling window) to provide context.
+Config fields (from .env):
+- LLM_PROVIDER=groq|openai
+- GROQ_API_KEY/GROQ_MODEL (if groq)
+- OPENAI_API_KEY/OPENAI_MODEL (if openai)
 
-System prompt
--------------
-get_system_prompt() builds a phone-call-friendly persona:
-- short answers (spoken audio)
-- natural conversation
-- no bullet points
-- safety/privacy guidance
+Implementation details
+----------------------
+- Uses the OpenAI Python SDK AsyncOpenAI for both providers.
+  - Groq: base_url=https://api.groq.com/openai/v1
+  - OpenAI: default base_url=https://api.openai.com/v1
+
+Per-call conversation history (important)
+-----------------------------------------
+The VoicePipeline creates a NEW LLM client per call (create_llm()).
+This prevents:
+- cross-call “memory leakage”
+- concurrent call history interleaving
+
+System prompt + determinism
+---------------------------
+get_system_prompt() enforces:
+- TARGET_LANGUAGE: English/French
+- menu-only scope (with gentle pivots, not “firm” refusals)
+- checkout requirements: DO NOT confirm order unless name+address+phone+email are collected and confirmed
+
+Failure mode you observed (“I’m sorry, I’m having trouble…”)
+------------------------------------------------------------
+That sentence is emitted when the LLM provider call fails (network/key/model issue).
+This repo reduces how often you hit the LLM while sharing contact info by handling checkout deterministically.
 
 ================================================================================
-9) Text-to-speech (Cartesia): src/agent/tts.py
+11) TTS layer: src/agent/tts.py (Cartesia streaming)
 ================================================================================
 
 Connection and request format
 -----------------------------
-CartesiaTTS opens a WebSocket to:
-wss://api.cartesia.ai/tts/websocket?api_key=...&cartesia_version=...
+- WebSocket URL:
+  wss://api.cartesia.ai/tts/websocket?api_key=...&cartesia_version=2024-06-10
+- Requests PCM S16LE @ 8000 Hz and converts to μ-law for Twilio.
 
-It sends a JSON request:
-- model_id: "sonic-english"
-- transcript: text to speak
-- voice: {"mode":"id","id": CARTESIA_VOICE_ID}
-- output_format:
-  - container: raw
-  - encoding: pcm_s16le
-  - sample_rate: 8000
+Context cancellation (barge-in)
+-------------------------------
+CartesiaTTS generates a context_id per request and supports cancel_context():
+  { "context_id": "...", "cancel": true }
+This is best-effort: Twilio `clear` + local cutoff are authoritative.
 
-Streaming audio
----------------
-Cartesia sends messages like:
-- {"type":"chunk","data":"<base64 PCM bytes>"}
-- {"type":"done"}
-
-The repo converts PCM -> mu-law via pcm_8k_to_ulaw() and yields TTSChunk objects.
-
-Cancellation
-------------
-CartesiaTTS supports:
-- cancel(): local flag to stop processing additional chunks
-- cancel_context(): attempts to send a context cancel message (not currently used
-  by the pipeline's interruption handler)
-
-================================================================================
-10) Semantic routing + cached audio: src/agent/routing.py
-================================================================================
-
-Goal
-----
-If the caller asks a very common question (pricing / who are you / stop),
-respond instantly with pre-rendered audio instead of calling the LLM+TTS.
-
-How it works
-------------
-- semantic-router + FastEmbedEncoder embed the transcript and pick a route.
-- CachedAudioManager loads assets/audio/{route}.mulaw into memory and chunks it
-  into 160-byte frames.
-
-Routes included
----------------
-- pricing
-- who_are_you
-- stop (also triggers hangup after playing the audio)
-
-Building cached audio
----------------------
-Use:
-- make audio
-- scripts/build_audio.sh (Linux/Mac)
-- scripts/build_audio.py (Windows-friendly)
-
-These convert WAV sources into raw mu-law 8 kHz (.mulaw) using ffmpeg.
-
-================================================================================
-11) Structured extraction (background): src/agent/extract.py
-================================================================================
-
-Goal
-----
-After each completed assistant response, optionally extract structured data from
-the turn (intent, name, phone, next_step, consent_to_follow_up).
-
-How it works
-------------
-- Uses Instructor (instructor.from_groq) + Groq model to produce a Pydantic
-  CallExtraction object.
-- Runs in a background worker queue (ExtractionQueue) so it does not block the
-  live audio loop.
-
-Outputs
--------
-ExtractionQueue stores a list of ExtractionResult objects in memory.
-There is no persistent storage by default.
+“Pause then last word” fix
+--------------------------
+Cartesia can send `flush_done` before `done`. tts.py treats `flush_done` as end-of-audio
+so the pipeline can flush the last partial 20 ms frame immediately.
 
 ================================================================================
 12) The per-call orchestrator: src/agent/pipeline.py
 ================================================================================
 
-Lifecycle
----------
-- create_pipeline(send_message) constructs VoicePipeline and calls start().
-- start():
-  - get_llm() singleton
-  - router initialization (if enabled)
-  - starts ExtractionQueue
-  - starts STT and registers transcript callback
-- stop():
-  - cancels tasks
-  - stops STT/TTS and extraction queue
-  - logs call metrics
-
-State machine
--------------
-PipelineState values:
-- IDLE -> LISTENING -> PROCESSING -> SPEAKING
-- INTERRUPTED is used during barge-in handling.
-
-Inbound audio handling
-----------------------
-- MEDIA events contain mu-law bytes (event.payload).
-- pipeline sends them directly to Deepgram via STTManager.send_audio().
-
-Transcript handling
--------------------
-- Partial transcripts while SPEAKING are used for barge-in detection:
-  if words >= MIN_INTERRUPTION_WORDS => interrupt.
-- Final transcripts (is_final and speech_final) start a "turn":
-  1) router.try_route(transcript)
-  2) else: call the LLM, then speak the response.
-
-Outbound audio pacing (key detail)
-----------------------------------
-When speaking an LLM response, the pipeline:
-- starts an "audio pacer" task that sends exactly one 160-byte frame every 20 ms
-- queues outbound frames into an asyncio.Queue
-- slices streaming TTS bytes into exact 160-byte frames and enqueues them
-- pads only once at the end to avoid inserting silence between chunks
-- sends a Twilio mark after the queue drains
-
-This reduces bursty sends and helps prevent choppy playback.
-
-Silence detector
-----------------
-While LISTENING, if the caller is silent for ~3 * SILENCE_TIMEOUT_SECONDS,
-the agent prompts: "Are you still there?"
-
-Hangup behavior
+Pipeline states
 ---------------
-If the "stop" route is matched, pipeline calls Twilio REST API to set the call
-status to "completed" after a short delay (lets goodbye audio finish).
+PipelineState:
+- IDLE
+- LISTENING
+- PROCESSING
+- SPEAKING
+- INTERRUPTED (during hard barge-in)
 
-================================================================================
-13) Scripts, tests, and deployments
-================================================================================
+Threading/concurrency model
+---------------------------
+- Twilio WS receive loop: never blocked by LLM/TTS.
+- Final transcripts are queued into _turn_queue.
+- A background _turn_worker processes turns sequentially (one LLM/TTS at a time).
 
-Makefile (common commands)
---------------------------
-- make install / make run / make test / make audio / make smoke
+Call start
+----------
+On Twilio START:
+- pipeline enters LISTENING immediately (so greeting can play regardless of STT readiness)
+- STT starts in a background task (so slow STT handshake doesn’t block greeting)
+- greeting is spoken via _speak_response() as a background task
 
-Windows convenience
--------------------
-- run.bat runs: .venv\Scripts\python.exe -m server.app
+Inbound audio (MEDIA)
+---------------------
+- Audio is μ-law bytes from Twilio.
+- Sent directly to STT (no PCM conversion).
+- _last_speech_time is updated on every inbound media frame (including silence frames).
+- A silence detector prompts after ~3 * SILENCE_TIMEOUT_SECONDS while LISTENING
+  (in practice: “no inbound media”, not “no speech”).
 
-Docker
-------
-- Dockerfile builds a slim Python image with ffmpeg installed
-- docker-compose.yml runs the service with env vars and mounts:
-  - ./assets/audio as read-only (cached audio)
-  - ./logs for logs
-
-Railway / Nixpacks / Procfile
+Turn start (final transcript)
 -----------------------------
-- Procfile: web: sh scripts/start.sh
-- scripts/start.sh runs Granian (ASGI server)
-- railway.json uses nixpacks builder and healthcheck /health
-- nixpacks.toml preloads jemalloc for performance (Linux)
+On final transcript (result.is_final OR result.speech_final):
+- queued to _turn_queue
+- processed by _process_transcript()
+
+Why “is_final OR speech_final” matters:
+- Some Deepgram configurations don’t reliably set speech_final.
+- Requiring speech_final can produce the “greets but never responds” bug.
+
+Menu-only checkout flow (deterministic)
+---------------------------------------
+When MENU_ONLY=true, pipeline tries _handle_checkout_flow(transcript) before routing/LLM:
+- ORDERING -> NAME -> NAME_CONFIRM -> ADDRESS -> ADDRESS_CONFIRM -> PHONE -> PHONE_CONFIRM -> EMAIL -> EMAIL_CONFIRM -> COMPLETE
+- Starts checkout when the caller says “that’s all / c’est tout” OR starts giving:
+  - a name (“my name is…”, “je m’appelle…”) OR
+  - an address (postal code / “address/adresse”) OR
+  - a phone number OR
+  - an email
+- Spells and confirms each piece of info:
+  - Name: letter-by-letter
+  - Address: spells at least street number + postal code (when detected)
+  - Phone: repeats digits
+  - Email: repeats slowly with AT/DOT (or AROBAS/POINT in French)
+- Order confirmation is only spoken after EMAIL_CONFIRM is affirmed.
+- The pipeline does NOT auto-hang up on “no / that’s all”; it only hangs up on explicit
+  “hang up / end call / raccroche(r)” phrases.
+
+Speaking (TTS) and marks
+------------------------
+_speak_response(text):
+- waits briefly for STT to go quiet before speaking (min 250 ms, max 1200 ms)
+  to avoid talking over the caller when endpointing emits early finals
+- splits text into sentence-ish segments
+- for each segment:
+  - streams Cartesia TTS
+  - frames μ-law into exact 160-byte Twilio frames
+  - enqueues frames into the audio pacer
+  - sends a Twilio `mark` after the segment (sentence-level mark)
+
+Outbound audio pacer (timing + buffering)
+-----------------------------------------
+- Sends exactly 1 audio frame every 20 ms.
+- Prebuffers up to max(3, jitter_buffer_ms/20) paced frames before starting:
+  - jitter_buffer_ms default is 100 ms -> 5 frames
+- Control messages (mark/clear) are sent immediately (not paced).
+- If the pacer falls behind by >40 ms, it increments an underrun counter and resets timing.
+- On pipeline stop, it logs:
+  - underflows (pacer underruns)
+  - queue_depth_max
+  - mark_rtt_ms (average)
+
+================================================================================
+13) Barge-in (“clean interrupts”): how it works and what to look for
+================================================================================
+
+Two-stage interruption
+----------------------
+While the agent is SPEAKING:
+1) Soft interrupt (pause):
+   - Triggered when STT indicates speech started (VAD) or interim text appears.
+   - Stops enqueueing NEW TTS frames (does not clear Twilio yet).
+2) Hard interrupt (nuclear flush):
+   - Triggered by any of:
+     - hard interrupt phrases (“stop”, “wait”, “hold on”, “arrete”, etc.)
+     - interim transcript word_count >= max(2, MIN_INTERRUPTION_WORDS) and not a backchannel
+     - continued speech energy >150 ms (or >400 ms for “ok/oui” backchannels)
+   - Actions:
+     a) bump playback_generation_id (so stale marks are ignored)
+     b) send Twilio `clear` immediately (flush buffered audio on phone)
+     c) cancel in-flight LLM task(s)
+     d) cancel Cartesia context_id (best effort)
+     e) stop pacer + drop queued outbound audio
+     f) reset STT state and return to LISTENING
+
+Verification: “clear is immediate”
+----------------------------------
+On hard interrupt, pipeline logs:
+- “Barge-in hard interrupt” (with barge_in_hard_ms)
+- “Playback generation bumped”
+- “Twilio clear sent”
+
+There is a unit test ensuring `clear` is the first Twilio message sent during hard interrupt:
+- tests/test_pipeline_barge_in_clear.py
+
+================================================================================
+14) Where delays come from (and what the logs measure)
+================================================================================
+
+Twilio transport timing
+-----------------------
+- Inbound media arrives as 20 ms frames. Network jitter affects when frames arrive.
+- Outbound playback is affected by:
+  - your pacer prebuffer (default 100 ms)
+  - Twilio’s internal buffer
+  - phone/PSTN jitter
+
+STT timing
+----------
+- v1 endpointing=300 means “finalization” often waits for ~300 ms of silence.
+- interim_results=true provides partial text earlier for faster barge-in.
+- stt.py computes TranscriptionResult.latency_ms as:
+  (time_now - last_audio_time) * 1000
+  This is a rough approximation of “audio in -> transcript out” latency.
+
+Language switching timing
+-------------------------
+- Automatic switch requires:
+  - >=12 chars, confidence>=0.75, and 2 consecutive eligible final transcripts
+  - plus a 20 second hold time after any switch
+- Explicit overrides switch immediately (and the agent confirms once).
+
+LLM timing
+----------
+pipeline TurnMetrics captures:
+- llm_first_token_ms (time to first streamed token)
+- llm_total_ms (time until stream ends)
+LLM speed depends on provider, model, network, and prompt size (menu-only injects full menu).
+
+TTS timing
+----------
+TurnMetrics captures:
+- tts_start_ms (time to first audio chunk produced by Cartesia)
+- tts_total_ms (total synth time)
+
+Playback timing
+--------------
+TwilioProtocolHandler captures mark RTT:
+- mark_rtt_ms reflects “mark sent -> Twilio ack received”
+This includes Twilio buffering + playback delay.
+
+Speech-end gating (“don’t talk over me”)
+----------------------------------------
+Before speaking, the pipeline waits for STT quiet:
+- minimum quiet: 250 ms since last non-empty STT text
+- maximum wait: 1200 ms
+This can add a small “polite delay”, but prevents overlapping speech in noisy PSTN conditions.
+
+================================================================================
+15) Scripts, tests, deployments (how to verify behavior)
+================================================================================
 
 Tests
 -----
-- tests/test_twiml.py: TwiML, health, metrics endpoints
-- tests/test_twilio_protocol.py: Twilio WebSocket protocol parsing/creation
-- tests/test_audio.py: audio utilities (note: imports numpy)
-- tests/test_routing.py: routing + cached audio (model tests skipped by default)
+Run:
+  pytest -q
+
+Notable tests:
+- tests/test_twiml.py: TwiML generation, endpoints
+- tests/test_twilio_protocol.py: mark/clear generation + parsing
+- tests/test_pipeline_barge_in_clear.py: clear is sent immediately on hard interrupt
+- tests/test_lang_state.py + scripts/language_switch_harness.py: EN↔FR stabilization behavior
+- tests/test_menu.py: menu.html parsing
+- tests/test_stt_flux.py: 80 ms batching logic when Flux is enabled
+
+Deployment
+----------
+- Procfile uses scripts/start.sh, which runs Granian.
+- Railway uses healthcheck /health.
+- /stream-status endpoint logs Twilio stream errors (useful for “remote hang up”).
 
 ================================================================================
-14) What "everything" does NOT mean (third-party/vendor code)
+16) Common failure modes (what changed, what to check)
 ================================================================================
 
-This repo contains large upstream distributions and local environment folders
-(e.g., .venv, ffmpeg-master-latest-win64-gpl-shared). The behavior of those
-third-party packages/binaries is governed by their upstream documentation.
-This document focuses on the first-party application code and how it connects
-those external services together.
+“Normal remote hang up” / immediate hangup
+------------------------------------------
+- Twilio couldn’t connect to wss://PUBLIC_HOST/ws or subprotocol mismatch.
+- Check server logs for:
+  - “Generated TwiML”
+  - “Stream status callback” (error codes/messages)
+  - “WebSocket accepted”
+
+“She greets but doesn’t respond”
+--------------------------------
+- STT didn’t connect or didn’t produce finals.
+- Check for “STT ready” vs “STT failed to start”.
+- This repo processes is_final OR speech_final to avoid missing turns.
+
+Stuck repeating “I’m having trouble right now…”
+------------------------------------------------
+- LLM provider call is failing (network/key/model).
+- Check provider config and startup validation logs.
+- During checkout (name/address/phone/email), the pipeline avoids the LLM, so if you still hit
+  that message, you’re likely still in “ordering” or asking non-checkout questions.
+
+Flux “latest turn-taking” not active
+------------------------------------
+- Your Deepgram account may reject /v2/listen with HTTP 400.
+- The repo auto-falls back to /v1/listen while staying on nova-3.
 
 ================================================================================
-15) Quick "how to follow the code" checklist
+17) Quick “follow the code” reading order
 ================================================================================
 
-If you're tracing a live call end-to-end, read in this order:
-1) server/app.py (endpoints, lifecycle)
-2) src/agent/pipeline.py (per-call orchestration)
-3) src/agent/twilio_protocol.py (message schema)
-4) src/agent/stt.py (Deepgram streaming)
-5) src/agent/llm.py (Groq streaming)
-6) src/agent/tts.py (Cartesia streaming)
-7) src/agent/routing.py (optional cached responses)
-8) src/agent/extract.py (optional background extraction)
+1) server/app.py (endpoints, TwiML, WebSocket accept/subprotocol, stream-status)
+2) src/agent/pipeline.py (call lifecycle, turn worker, pacer, barge-in, checkout)
+3) src/agent/twilio_protocol.py (media/mark/clear, playback_generation_id)
+4) src/agent/stt.py (Deepgram Nova-3 streaming, v2->v1 fallback, Flux batching)
+5) src/agent/language.py (stabilized EN↔FR switching)
+6) src/agent/menu.py (menu.html parsing, deterministic menu context)
+7) src/agent/llm.py (Groq/OpenAI streaming, per-call history, system prompt)
+8) src/agent/tts.py (Cartesia streaming, context cancel, flush_done handling)
 
 End.
