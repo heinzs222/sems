@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 import unicodedata
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 LanguageCode = Literal["en", "fr"]
 
@@ -124,6 +124,145 @@ def normalize_detected_language(detected_language: Optional[str]) -> Optional[La
     if norm.startswith("en"):
         return "en"
     return None
+
+
+_FRENCH_CHAR_RE = re.compile(r"[àâäçéèêëîïôöùûüÿœæ]", re.IGNORECASE)
+
+_FR_STOPWORDS = {
+    "je",
+    "j",
+    "tu",
+    "il",
+    "elle",
+    "on",
+    "nous",
+    "vous",
+    "ils",
+    "elles",
+    "bonjour",
+    "bonsoir",
+    "salut",
+    "merci",
+    "s'il",
+    "sil",
+    "svp",
+    "plait",
+    "suis",
+    "est",
+    "et",
+    "ou",
+    "mais",
+    "avec",
+    "pour",
+    "sur",
+    "dans",
+    "de",
+    "des",
+    "du",
+    "la",
+    "le",
+    "les",
+    "un",
+    "une",
+    "a",
+    "au",
+    "aux",
+    "ce",
+    "cette",
+    "ces",
+    "mon",
+    "ma",
+    "mes",
+    "votre",
+    "vos",
+    "commande",
+    "commander",
+    "veux",
+    "voudrais",
+    "prendre",
+    "prix",
+    "combien",
+}
+
+_EN_STOPWORDS = {
+    "i",
+    "im",
+    "i'm",
+    "you",
+    "your",
+    "we",
+    "us",
+    "hello",
+    "hi",
+    "hey",
+    "thanks",
+    "thank",
+    "please",
+    "yes",
+    "no",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "but",
+    "with",
+    "for",
+    "to",
+    "of",
+    "in",
+    "on",
+    "is",
+    "are",
+    "want",
+    "would",
+    "like",
+    "order",
+    "price",
+    "how",
+    "much",
+}
+
+
+def infer_language_from_text(text: str) -> Tuple[Optional[LanguageCode], Optional[float]]:
+    """
+    Lightweight English vs French language inference from transcript text.
+
+    This is a fallback when STT does not provide `detected_language` / `language_confidence`.
+
+    Returns:
+        (language, confidence) where confidence is in [0, 1].
+    """
+    if not text or not text.strip():
+        return None, None
+
+    accent_hits = len(_FRENCH_CHAR_RE.findall(text))
+    normalized = _normalize_for_matching(text)
+    tokens = re.findall(r"[a-z']+", normalized)
+    if not tokens:
+        return None, None
+
+    fr_hits = sum(1 for t in tokens if t in _FR_STOPWORDS)
+    en_hits = sum(1 for t in tokens if t in _EN_STOPWORDS)
+
+    # Accents strongly suggest French; give them a small boost without overpowering stopwords.
+    score_fr = fr_hits + (0.5 * min(accent_hits, 6))
+    score_en = float(en_hits)
+
+    if score_fr <= 0 and score_en <= 0:
+        return None, None
+
+    if score_fr == score_en:
+        return None, None
+
+    lang: LanguageCode = "fr" if score_fr > score_en else "en"
+    major = max(score_fr, score_en)
+    minor = min(score_fr, score_en)
+
+    confidence = (major - minor) / major if major > 0 else 0.0
+    confidence = max(0.0, min(1.0, float(confidence)))
+
+    return lang, confidence
 
 
 @dataclass

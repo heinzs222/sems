@@ -44,6 +44,7 @@ from src.agent.extract import ExtractionQueue
 from src.agent.language import (
     detect_language_override,
     detect_language_switch_command,
+    infer_language_from_text,
     LangState,
     LanguageCode,
 )
@@ -578,24 +579,40 @@ class VoicePipeline:
             await self._apply_language_override(override_language)
             return
 
-        # Stabilized auto-switch using Deepgram's language detection.
+        # Stabilized auto-switch using Deepgram's language detection (when available),
+        # otherwise fall back to lightweight text-based inference.
         previous_language = self._lang_state.current
         now = time.time()
+
+        detection_source: Optional[str] = None
+        effective_detected_language = detected_language
+        effective_language_confidence = language_confidence
+
+        if effective_detected_language and effective_language_confidence is not None:
+            detection_source = "deepgram"
+        else:
+            inferred_language, inferred_confidence = infer_language_from_text(transcript)
+            if inferred_language is not None:
+                effective_detected_language = inferred_language
+                effective_language_confidence = inferred_confidence
+                detection_source = "text"
+
         switched, reason = self._lang_state.update_from_detection(
             text=transcript,
-            detected_language=detected_language,
-            language_confidence=language_confidence,
+            detected_language=effective_detected_language,
+            language_confidence=effective_language_confidence,
             now=now,
         )
 
         logger.info(
             "Language decision",
-            detected_language=detected_language,
-            language_confidence=language_confidence,
+            detected_language=effective_detected_language,
+            language_confidence=effective_language_confidence,
             current_language=self._lang_state.current,
             switched=switched,
             reason=reason or None,
             previous_language=previous_language,
+            detection_source=detection_source,
         )
         
         # Try semantic routing first

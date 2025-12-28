@@ -27,9 +27,13 @@ logger = structlog.get_logger(__name__)
 DEEPGRAM_V1_URL = "wss://api.deepgram.com/v1/listen"
 DEEPGRAM_V2_URL = "wss://api.deepgram.com/v2/listen"  # Flux endpoint
 
-# Prefer Deepgram v2 (/v2/listen). If it fails, we fall back to v1.
+# Prefer Deepgram v2 (/v2/listen). If it fails (common on some accounts), we fall back to v1.
 # You can force v1 only with USE_DEEPGRAM_V1_ONLY=true.
 USE_DEEPGRAM_V1_ONLY = os.getenv("USE_DEEPGRAM_V1_ONLY", "false").lower() == "true"
+
+# Some Deepgram accounts reject /v2/listen with HTTP 400. Cache that per-process so we don't
+# waste time retrying it every call.
+_DEEPGRAM_V2_DISABLED: bool = False
 
 
 @dataclass
@@ -115,9 +119,11 @@ class DeepgramSTT:
             # No conversion needed - Deepgram accepts mulaw encoding natively!
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}
 
-            # Prefer v2 for modern features like language detection; fall back for compatibility.
-            #
-            # NOTE: We intentionally use Nova-3 only (latest) and do not fall back to older models.
+            # NOTE:
+            # - We intentionally use Nova-3 only (latest) and do not fall back to older models.
+            # - Deepgram streaming currently rejects `detect_language=true` with Nova-3 on many
+            #   accounts (HTTP 400). For bilingual EN<->FR we use `language=multi` and perform
+            #   per-utterance language selection in the agent.
             candidates: list[tuple[str, str]] = []
             model = "nova-3"
             common = (
@@ -130,27 +136,27 @@ class DeepgramSTT:
                 f"&smart_format=true"
             )
 
-            # Candidate 1: v2 + detect_language
-            if not USE_DEEPGRAM_V1_ONLY:
+            # Candidate 1: v2 (Flux) if supported by the account.
+            if not USE_DEEPGRAM_V1_ONLY and not _DEEPGRAM_V2_DISABLED:
                 candidates.append(
                     (
-                        "v2_detect_language_nova-3",
+                        "v2_nova-3_multi",
                         DEEPGRAM_V2_URL
                         + common
                         + "&vad_events=true"
-                        + "&detect_language=true",
+                        + "&language=multi",
                     )
                 )
 
-            # Candidate 2: v1 + detect_language (fallback)
+            # Candidate 2: v1 fallback (widely supported).
             candidates.append(
                 (
-                    "v1_detect_language_nova-3",
+                    "v1_nova-3_multi",
                     DEEPGRAM_V1_URL
                     + common
                     + "&vad_events=true"
                     + "&endpointing=300"
-                    + "&detect_language=true",
+                    + "&language=multi",
                 )
             )
 
@@ -167,6 +173,14 @@ class DeepgramSTT:
                     break
                 except Exception as e:
                     last_error = e
+                    global _DEEPGRAM_V2_DISABLED
+                    if (
+                        label.startswith("v2_")
+                        and type(e).__name__ in ("InvalidStatus", "InvalidStatusCode")
+                        and "HTTP 400" in str(e)
+                    ):
+                        _DEEPGRAM_V2_DISABLED = True
+                        logger.info("Deepgram v2 disabled (HTTP 400)", endpoint=label)
                     logger.warning(
                         "Deepgram connection attempt failed",
                         endpoint=label,
@@ -364,7 +378,9 @@ class DeepgramSTT:
         for c in candidates:
             if detected is None:
                 value = c.get("detected_language")
-                if isinstance(value, str) and value.strip():
+                if not isinstance(value, str) or not value.strip():
+                    value = c.get("language")
+                if isinstance(value, str) and value.strip() and value.strip().lower() != "multi":
                     detected = value.strip()
             if confidence is None:
                 value = c.get("language_confidence")
