@@ -1,5 +1,5 @@
 """
-Groq LLM wrapper with OpenAI-compatible API.
+LLM wrapper (Groq or OpenAI) with OpenAI-compatible API.
 
 Provides:
 - Startup model validation
@@ -23,6 +23,7 @@ from src.agent.config import get_config
 logger = structlog.get_logger(__name__)
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 @dataclass
@@ -208,6 +209,61 @@ async def validate_groq_model(api_key: str, model_name: str) -> bool:
             )
 
 
+async def validate_openai_model(api_key: str, model_name: str) -> bool:
+    """
+    Validate that the configured OpenAI model exists.
+
+    Calls GET https://api.openai.com/v1/models to check.
+    """
+    logger.info("Validating OpenAI model", model=model_name)
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{OPENAI_BASE_URL}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10.0,
+            )
+
+            if response.status_code != 200:
+                logger.error(
+                    "Failed to fetch OpenAI models",
+                    status_code=response.status_code,
+                    response=response.text[:200],
+                )
+                raise SystemExit(
+                    f"Failed to validate OpenAI model. API returned status {response.status_code}. "
+                    "Check your OPENAI_API_KEY."
+                )
+
+            data = response.json()
+            models = data.get("data", [])
+            model_ids = [m.get("id") for m in models]
+
+            if model_name not in model_ids:
+                available = ", ".join(sorted(model_ids)[:15])
+                logger.error(
+                    "OpenAI model not found",
+                    requested_model=model_name,
+                    available_models=available,
+                )
+                raise SystemExit(
+                    f"OPENAI_MODEL '{model_name}' not found in available models.\n"
+                    f"Some available models include: {available}\n"
+                    "Please update OPENAI_MODEL in your .env file."
+                )
+
+            logger.info("OpenAI model validated successfully", model=model_name)
+            return True
+
+        except httpx.RequestError as e:
+            logger.error("Failed to connect to OpenAI API", error=str(e))
+            raise SystemExit(
+                f"Failed to connect to OpenAI API: {e}\n"
+                "Check your network connection and OPENAI_API_KEY."
+            )
+
+
 class GroqLLM:
     """
     Groq LLM client with streaming support.
@@ -220,12 +276,17 @@ class GroqLLM:
             config = get_config()
 
         self.config = config
-        self.model = config.groq_model
+        self.provider = (getattr(config, "llm_provider", "groq") or "groq").strip().lower()
 
-        self._client = AsyncOpenAI(
-            api_key=config.groq_api_key,
-            base_url=GROQ_BASE_URL,
-        )
+        if self.provider == "openai":
+            self.model = config.openai_model
+            self._client = AsyncOpenAI(api_key=config.openai_api_key)
+        else:
+            self.model = config.groq_model
+            self._client = AsyncOpenAI(
+                api_key=config.groq_api_key,
+                base_url=GROQ_BASE_URL,
+            )
 
         self._history = ConversationHistory(max_turns=config.max_history_turns)
 
@@ -234,6 +295,8 @@ class GroqLLM:
         return self._history
 
     async def validate_model(self) -> bool:
+        if self.provider == "openai":
+            return await validate_openai_model(self.config.openai_api_key, self.model)
         return await validate_groq_model(self.config.groq_api_key, self.model)
 
     async def generate_streaming(

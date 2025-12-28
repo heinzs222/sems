@@ -58,6 +58,13 @@ class Config:
     # Groq (LLM)
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
+
+    # LLM Provider (Groq/OpenAI)
+    # - Default is Groq for backwards compatibility.
+    # - Set LLM_PROVIDER=openai + OPENAI_API_KEY/OPENAI_MODEL to use ChatGPT.
+    llm_provider: str = "groq"  # "groq" | "openai"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
     
     # Feature flags
     router_enabled: bool = True
@@ -96,10 +103,23 @@ class Config:
             missing.append("DEEPGRAM_API_KEY")
         if not self.cartesia_api_key:
             missing.append("CARTESIA_API_KEY")
-        if not self.groq_api_key:
-            missing.append("GROQ_API_KEY")
-        if not self.groq_model:
-            missing.append("GROQ_MODEL")
+        provider = (self.llm_provider or "groq").strip().lower()
+        if provider not in ("groq", "openai"):
+            raise ConfigError(
+                f"Invalid LLM_PROVIDER '{self.llm_provider}'. Expected 'groq' or 'openai'."
+            )
+
+        if provider == "groq":
+            if not self.groq_api_key:
+                missing.append("GROQ_API_KEY")
+            if not self.groq_model:
+                missing.append("GROQ_MODEL")
+
+        if provider == "openai":
+            if not self.openai_api_key:
+                missing.append("OPENAI_API_KEY")
+            if not self.openai_model:
+                missing.append("OPENAI_MODEL")
         
         if missing:
             raise ConfigError(
@@ -120,7 +140,8 @@ class Config:
             deepgram_eager_eot_threshold=self.deepgram_eager_eot_threshold,
             deepgram_eot_threshold=self.deepgram_eot_threshold,
             deepgram_eot_timeout_ms=self.deepgram_eot_timeout_ms,
-            groq_model=self.groq_model,
+            llm_provider=self.llm_provider,
+            llm_model=self.openai_model if self.llm_provider == "openai" else self.groq_model,
             router_enabled=self.router_enabled,
             menu_only=self.menu_only,
             outlines_enabled=self.outlines_enabled,
@@ -130,6 +151,7 @@ class Config:
             deepgram_key_set=bool(self.deepgram_api_key),
             cartesia_key_set=bool(self.cartesia_api_key),
             groq_key_set=bool(self.groq_api_key),
+            openai_key_set=bool(self.openai_api_key),
         )
 
 
@@ -194,6 +216,11 @@ def get_config() -> Config:
         # Groq
         groq_api_key=os.getenv("GROQ_API_KEY", ""),
         groq_model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+
+        # LLM Provider
+        llm_provider=os.getenv("LLM_PROVIDER", "groq").strip().lower(),
+        openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         
         # Feature flags
         router_enabled=_get_bool("ROUTER_ENABLED", True),

@@ -268,6 +268,10 @@ class VoicePipeline:
         self._customer_address: str = ""
         self._customer_phone: str = ""
         self._customer_email: str = ""
+
+        # Track the last time we received any non-empty STT text (including interim results).
+        # Used to avoid talking over the caller when Deepgram endpointing emits early finals.
+        self._last_stt_text_time: float = 0.0
         
         # TTS state
         self._pending_transcript: str = ""
@@ -471,8 +475,18 @@ class VoicePipeline:
 
         # Prefer the original casing when possible by removing common prefixes again.
         original = t
-        original = re.sub(r"^(?i)(my name is|this is|it's|it is)\\s+", "", original).strip()
-        original = re.sub(r"^(?i)(je m'appelle|mon nom est|c'est)\\s+", "", original).strip()
+        original = re.sub(
+            r"^(my name is|this is|it's|it is)\\s+",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        ).strip()
+        original = re.sub(
+            r"^(je m'appelle|mon nom est|c'est)\\s+",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        ).strip()
         return original if original else normalized
 
     def _extract_address(self, text: str) -> str:
@@ -480,8 +494,18 @@ class VoicePipeline:
         if not t:
             return ""
         original = t
-        original = re.sub(r"^(?i)(my address is|address is|it's|it is)\\s+", "", original).strip()
-        original = re.sub(r"^(?i)(mon adresse est|l'adresse est|adresse|c'est)\\s+", "", original).strip()
+        original = re.sub(
+            r"^(my address is|address is|it's|it is)\\s+",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        ).strip()
+        original = re.sub(
+            r"^(mon adresse est|l'adresse est|adresse|c'est)\\s+",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        ).strip()
         return original if original else t
 
     def _extract_phone(self, text: str) -> str:
@@ -490,8 +514,18 @@ class VoicePipeline:
             return ""
 
         original = t
-        original = re.sub(r"^(?i)(my phone is|my number is|phone number is|phone is|number is)\\s+", "", original).strip()
-        original = re.sub(r"^(?i)(mon numero est|mon num\\S+ro est|numero|num\\S+ro|telephone|t\\S+l\\S+phone)\\s+", "", original).strip()
+        original = re.sub(
+            r"^(my phone is|my number is|phone number is|phone is|number is)\\s+",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        ).strip()
+        original = re.sub(
+            r"^(mon numero est|mon num\\S+ro est|numero|num\\S+ro|telephone|t\\S+l\\S+phone)\\s+",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        ).strip()
 
         digits = re.sub(r"\D+", "", original)
         if len(digits) == 11 and digits.startswith("1"):
@@ -593,21 +627,68 @@ class VoicePipeline:
                     await self._hangup_call()
                 return True
 
-            if not self._wants_done_order(transcript):
+            normalized = _normalize_for_intent(transcript)
+
+            mentioned_name = bool(
+                re.match(
+                    r"^(my name is|this is|it's|it is)\\b|^(je m'appelle|mon nom est|c'est)\\b",
+                    normalized,
+                )
+            )
+            mentioned_address = bool(
+                _CA_POSTAL_RE.search(transcript)
+                or re.search(r"\\b(address|adresse)\\b", normalized)
+            )
+
+            phone = self._extract_phone(transcript)
+            email = self._extract_email(transcript)
+
+            # If the caller starts giving their details without saying "that's all",
+            # treat it as checkout start so we don't bounce to the LLM (and risk failures).
+            wants_checkout = (
+                self._wants_done_order(transcript)
+                or mentioned_name
+                or mentioned_address
+                or bool(phone)
+                or bool(email)
+            )
+
+            if not wants_checkout:
                 return False
 
-            # Start checkout: ask for name.
-            self._checkout_phase = CheckoutPhase.NAME
-            self._customer_name = ""
-            self._customer_address = ""
-            self._customer_phone = ""
-            self._customer_email = ""
-            prompt = (
-                "Parfait ! Pour finaliser la commande, quel est votre nom ?"
+            # Opportunistically capture any details they already said.
+            if mentioned_name and not self._customer_name:
+                name = self._extract_name(transcript)
+                if name:
+                    self._customer_name = name
+            if mentioned_address and not self._customer_address:
+                address = self._extract_address(transcript)
+                if address:
+                    self._customer_address = address
+            if phone and not self._customer_phone:
+                self._customer_phone = phone
+            if email and not self._customer_email:
+                self._customer_email = email
+
+            # Start checkout at the next missing/confirm step (name first).
+            if not self._customer_name:
+                self._checkout_phase = CheckoutPhase.NAME
+                prompt = (
+                    "Parfait ! Pour finaliser, quel est votre nom ?"
+                    if language == "fr"
+                    else "Perfect! To finalize, what name should I put it under?"
+                )
+                await self._speak_response(prompt)
+                return True
+
+            self._checkout_phase = CheckoutPhase.NAME_CONFIRM
+            spelled = self._spell_alnum(self._customer_name)
+            confirm = (
+                f"Super ! J'ai noté {self._customer_name}. Je l'épelle: {spelled}. C'est bien ça ?"
                 if language == "fr"
-                else "Perfect! To finalize, what name should I put it under?"
+                else f"Awesome! I got {self._customer_name}. That's {spelled}. Did I spell that right?"
             )
-            await self._speak_response(prompt)
+            await self._speak_response(confirm)
             return True
 
         if self._checkout_phase == CheckoutPhase.NAME:
@@ -634,11 +715,47 @@ class VoicePipeline:
 
         if self._checkout_phase == CheckoutPhase.NAME_CONFIRM:
             if self._is_affirmative(transcript):
+                if self._customer_address:
+                    spelled_number = self._spell_first_number(self._customer_address)
+                    spelled_postal = self._spell_postal_code(self._customer_address)
+
+                    parts: List[str] = []
+                    if spelled_number:
+                        parts.append(
+                            f"numéro {spelled_number}"
+                            if language == "fr"
+                            else f"number {spelled_number}"
+                        )
+                    if spelled_postal:
+                        parts.append(
+                            f"code postal {spelled_postal}"
+                            if language == "fr"
+                            else f"postal code {spelled_postal}"
+                        )
+                    spelled_bits = "; ".join(parts)
+
+                    if language == "fr":
+                        confirm = (
+                            f"Parfait. J'ai déjà noté l'adresse: {self._customer_address}. Pour confirmer: {spelled_bits}. C'est exact ?"
+                            if spelled_bits
+                            else f"Parfait. J'ai déjà noté l'adresse: {self._customer_address}. C'est exact ?"
+                        )
+                    else:
+                        confirm = (
+                            f"Great. I already noted your address as: {self._customer_address}. Just to confirm: {spelled_bits}. Is that correct?"
+                            if spelled_bits
+                            else f"Great. I already noted your address as: {self._customer_address}. Is that correct?"
+                        )
+
+                    self._checkout_phase = CheckoutPhase.ADDRESS_CONFIRM
+                    await self._speak_response(confirm)
+                    return True
+
                 self._checkout_phase = CheckoutPhase.ADDRESS
                 ask = (
-                    "Parfait. Et votre adresse, s’il vous plaît ?"
+                    "Parfait. Et votre adresse, s'il vous plaît ?"
                     if language == "fr"
-                    else "Great. And what’s your address?"
+                    else "Great. And what's your address?"
                 )
                 await self._speak_response(ask)
                 return True
@@ -709,6 +826,17 @@ class VoicePipeline:
 
         if self._checkout_phase == CheckoutPhase.ADDRESS_CONFIRM:
             if self._is_affirmative(transcript):
+                if self._customer_phone:
+                    digits_spelled = self._spell_phone_digits(self._customer_phone)
+                    confirm = (
+                        f"Parfait. Pour confirmer le numéro: {digits_spelled}. C'est bien ça ?"
+                        if language == "fr"
+                        else f"Perfect. Just to confirm the number: {digits_spelled}. Did I get that right?"
+                    )
+                    self._checkout_phase = CheckoutPhase.PHONE_CONFIRM
+                    await self._speak_response(confirm)
+                    return True
+
                 self._checkout_phase = CheckoutPhase.PHONE
                 ask = (
                     "Parfait. Quel est votre numéro de téléphone ?"
@@ -760,6 +888,17 @@ class VoicePipeline:
 
         if self._checkout_phase == CheckoutPhase.PHONE_CONFIRM:
             if self._is_affirmative(transcript):
+                if self._customer_email:
+                    spelled = self._spell_email(self._customer_email, language=language)
+                    confirm = (
+                        f"Parfait. Pour confirmer l'email: {spelled}. C'est bien ça ?"
+                        if language == "fr"
+                        else f"Perfect. Just to confirm the email: {spelled}. Did I get that right?"
+                    )
+                    self._checkout_phase = CheckoutPhase.EMAIL_CONFIRM
+                    await self._speak_response(confirm)
+                    return True
+
                 self._checkout_phase = CheckoutPhase.EMAIL
                 ask = (
                     "Parfait. Et quel est votre email ?"
@@ -1145,6 +1284,9 @@ class VoicePipeline:
         if not self._is_running:
             return
 
+        if result.text and result.text.strip():
+            self._last_stt_text_time = time.time()
+
         if not self._logged_first_transcript and result.text:
             self._logged_first_transcript = True
             logger.info(
@@ -1277,24 +1419,35 @@ class VoicePipeline:
         # - Cancel Cartesia context (best effort)
         # - Stop our pacer + drop queued audio
         # - Clear Twilio's buffered audio
+        # Bump playback generation so any late mark acks are ignored after `clear`.
+        playback_generation_id = self._protocol.bump_playback_generation()
+
+        # Tell Twilio to flush buffered audio immediately (authoritative for barge-in).
+        clear_msg = self._protocol.create_clear()
+        if clear_msg:
+            try:
+                await self._send_message(clear_msg)
+                logger.info(
+                    "Twilio clear sent",
+                    call_sid=self.call_sid,
+                    stream_sid=self.stream_sid,
+                    playback_generation_id=playback_generation_id,
+                    reason=reason,
+                )
+            except Exception as e:
+                logger.warning("Failed to send Twilio clear", error=str(e))
+
         tasks: List[asyncio.Future] = []
-        
+
         try:
             tasks.append(asyncio.create_task(self._tts.cancel_context()))
         except Exception:
             pass
-        
+
         self._tts.cancel_current()
         tasks.append(asyncio.create_task(self._stop_pacer()))
         self._outbound_ulaw_remainder = b""
 
-        # Bump playback generation so any late mark acks are ignored after `clear`.
-        self._protocol.bump_playback_generation()
-        
-        clear_msg = self._protocol.create_clear()
-        if clear_msg:
-            tasks.append(asyncio.create_task(self._send_message(clear_msg)))
-        
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
@@ -1686,6 +1839,25 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 pass
 
+    async def _wait_for_stt_quiet(self, *, min_quiet_ms: int = 250, max_wait_ms: int = 1200) -> None:
+        """
+        Wait briefly for STT to go quiet so we don't talk over the caller.
+
+        We use the last time we saw any STT text (including interim results) as a proxy for
+        "user is still talking". This helps in cases where Deepgram emits early finals.
+        """
+        if self._last_stt_text_time <= 0:
+            return
+
+        start = time.time()
+        while self._is_running and self._state != PipelineState.INTERRUPTED:
+            since_ms = (time.time() - self._last_stt_text_time) * 1000
+            if since_ms >= min_quiet_ms:
+                return
+            if (time.time() - start) * 1000 >= max_wait_ms:
+                return
+            await asyncio.sleep(0.02)
+
     async def _enqueue_outbound(self, message: str, *, pace: bool) -> None:
         """Enqueue an outbound message and track queue depth."""
         if not message:
@@ -1707,6 +1879,9 @@ class VoicePipeline:
         """
         if not text or not self._is_running:
             return
+
+        # Avoid talking over the caller when STT is still producing interim text.
+        await self._wait_for_stt_quiet()
         
         tts_start = time.time()
         first_audio_time = None
