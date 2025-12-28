@@ -169,7 +169,11 @@ async def generate_twiml(request: Request) -> Response:
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://{config.public_host}/ws" />
+        <Stream
+            url="wss://{config.public_host}/ws"
+            statusCallback="https://{config.public_host}/stream-status"
+            statusCallbackMethod="POST"
+        />
     </Connect>
 </Response>"""
     
@@ -181,6 +185,33 @@ async def generate_twiml(request: Request) -> Response:
     )
 
 
+@app.post("/stream-status")
+@app.get("/stream-status")
+async def stream_status(request: Request) -> Response:
+    """
+    Receive Twilio Media Streams status callbacks.
+
+    This helps debug issues where calls hang up quickly because Twilio couldn't connect
+    to our WebSocket endpoint.
+    """
+    try:
+        form = await request.form()
+        data = dict(form)
+    except Exception:
+        data = {}
+
+    logger.info(
+        "Stream status callback",
+        stream_sid=data.get("StreamSid"),
+        call_sid=data.get("CallSid"),
+        status=data.get("Status"),
+        error_code=data.get("ErrorCode"),
+        error_message=data.get("ErrorMessage"),
+    )
+
+    return Response(status_code=204)
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     """
@@ -188,7 +219,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     
     Handles incoming audio and sends outgoing audio for a call.
     """
-    await websocket.accept()
+    # Twilio may request a WebSocket subprotocol (commonly "twilio").
+    # Accept it if present to avoid immediate disconnects on some clients.
+    subprotocol_header = websocket.headers.get("sec-websocket-protocol")
+    selected_subprotocol = None
+    if subprotocol_header:
+        requested = [p.strip() for p in subprotocol_header.split(",") if p.strip()]
+        if "twilio" in requested:
+            selected_subprotocol = "twilio"
+    await websocket.accept(subprotocol=selected_subprotocol)
+
+    logger.info(
+        "WebSocket accepted",
+        selected_subprotocol=selected_subprotocol,
+        requested_subprotocols=subprotocol_header,
+    )
     
     metrics.total_connections += 1
     metrics.active_connections += 1
