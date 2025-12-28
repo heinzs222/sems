@@ -115,50 +115,53 @@ class DeepgramSTT:
             # No conversion needed - Deepgram accepts mulaw encoding natively!
             headers = {"Authorization": f"Token {self.config.deepgram_api_key}"}
 
-            common = (
-                f"?model=nova-3"
-                f"&encoding=mulaw"
-                f"&sample_rate=8000"
-                f"&channels=1"
-                f"&punctuate=true"
-                f"&interim_results=true"
-                f"&smart_format=true"
-            )
-
             # Prefer v2 for modern features like language detection; fall back for compatibility.
+            # Also try multiple models because availability can vary by account.
             candidates: list[tuple[str, str]] = []
-            if not USE_DEEPGRAM_V1_ONLY:
+            for model in ("nova-3", "nova-2"):
+                common = (
+                    f"?model={model}"
+                    f"&encoding=mulaw"
+                    f"&sample_rate=8000"
+                    f"&channels=1"
+                    f"&punctuate=true"
+                    f"&interim_results=true"
+                    f"&smart_format=true"
+                )
+
+                if not USE_DEEPGRAM_V1_ONLY:
+                    candidates.append(
+                        (
+                            f"v2_detect_language_{model}",
+                            DEEPGRAM_V2_URL
+                            + common
+                            + "&vad_events=true"
+                            + "&detect_language=true",
+                        )
+                    )
+
                 candidates.append(
                     (
-                        "v2_detect_language",
-                        DEEPGRAM_V2_URL
+                        f"v1_detect_language_{model}",
+                        DEEPGRAM_V1_URL
                         + common
                         + "&vad_events=true"
                         + "&endpointing=300"
                         + "&detect_language=true",
                     )
                 )
-            candidates.append(
-                (
-                    "v1_detect_language",
-                    DEEPGRAM_V1_URL
-                    + common
-                    + "&vad_events=true"
-                    + "&endpointing=300"
-                    + "&detect_language=true",
+
+                # Last-resort fallback: pin language so the agent can still respond.
+                candidates.append(
+                    (
+                        f"v1_pinned_language_{model}",
+                        DEEPGRAM_V1_URL
+                        + common
+                        + "&vad_events=true"
+                        + "&endpointing=300"
+                        + f"&language={self.language}",
+                    )
                 )
-            )
-            # Last-resort fallback: pin language so the agent can still respond.
-            candidates.append(
-                (
-                    "v1_pinned_language",
-                    DEEPGRAM_V1_URL
-                    + common
-                    + "&vad_events=true"
-                    + "&endpointing=300"
-                    + f"&language={self.language}",
-                )
-            )
 
             last_error: Optional[BaseException] = None
             for label, url in candidates:
