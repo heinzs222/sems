@@ -51,7 +51,13 @@ from src.agent.language import (
     LangState,
     LanguageCode,
 )
-from src.agent.menu import get_menu_catalog, looks_like_menu_request, find_menu_items
+from src.agent.menu import (
+    get_menu_catalog,
+    looks_like_menu_request,
+    looks_like_full_menu_request,
+    find_menu_items,
+    find_menu_sections,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -328,12 +334,23 @@ class VoicePipeline:
         self._pacer_task: Optional[asyncio.Task] = None
         self._pacer_running: bool = False
         self._pacer_underruns: int = 0
+        self._pacer_late_resets: int = 0
         self._queue_depth_max: int = 0
-        self._jitter_buffer_ms: int = 100  # Buffer 100ms before starting playback
+        self._jitter_buffer_base_ms: int = int(getattr(config, "jitter_buffer_ms", 160))
+        self._jitter_buffer_ms: int = self._jitter_buffer_base_ms
+        self._jitter_buffer_min_ms: int = int(getattr(config, "jitter_buffer_min_ms", 80))
+        self._jitter_buffer_max_ms: int = int(getattr(config, "jitter_buffer_max_ms", 300))
+        self._jitter_buffer_step_ms: int = int(getattr(config, "jitter_buffer_adapt_step_ms", 20))
+        self._jitter_buffer_idle_threshold_ms: int = int(
+            getattr(config, "jitter_buffer_idle_threshold_ms", 250)
+        )
+        self._jitter_buffer_stable_bursts: int = 0
         self._outbound_ulaw_remainder: bytes = b""
         
         # Silence detection
-        self._last_speech_time: float = 0.0
+        self._last_audio_frame_time: float = 0.0
+        self._last_speech_activity_time: float = 0.0
+        self._last_silence_prompt_time: float = 0.0
         self._silence_task: Optional[asyncio.Task] = None
 
         # Debug flags (kept minimal to avoid noisy logs)
@@ -539,29 +556,71 @@ class VoicePipeline:
         if not t:
             return ""
 
-        normalized = _normalize_for_intent(t)
-        patterns = (
-            r"^(my name is|this is|it's|it is)\s+",
-            r"^(je m'appelle|mon nom est|c'est)\s+",
-        )
-        for pat in patterns:
-            normalized = re.sub(pat, "", normalized, flags=re.IGNORECASE)
+        # Strip a few common "starter" fillers first.
+        t = re.sub(r"^(um+|uh+|erm+|euh+|hum+)\b[, ]*", "", t, flags=re.IGNORECASE).strip()
+        if not t:
+            return ""
 
-        # Prefer the original casing when possible by removing common prefixes again.
-        original = t
-        original = re.sub(
-            r"^(my name is|this is|it's|it is)\s+",
-            "",
-            original,
-            flags=re.IGNORECASE,
-        ).strip()
-        original = re.sub(
-            r"^(je m'appelle|mon nom est|c'est)\s+",
-            "",
-            original,
-            flags=re.IGNORECASE,
-        ).strip()
-        return original if original else normalized
+        normalized = _normalize_for_intent(t)
+
+        # Remove common "my name is ..." prefixes, even if the user pauses and the STT finalizes
+        # the prefix alone (e.g., "my name is" without a trailing name).
+        # This prevents treating the prefix itself as a name.
+        patterns = (
+            r"^(my name is|my name'?s|this is|it'?s|it is)\b[,:\-–—]?\s*",
+            r"^(je m'appelle|j'm'appelle|mon nom est|c'?est)\b[,:\-–—]?\s*",
+        )
+
+        normalized_stripped = normalized
+        for pat in patterns:
+            normalized_stripped = re.sub(pat, "", normalized_stripped, flags=re.IGNORECASE).strip()
+
+        # Prefer original casing/accents when possible by removing prefixes again on the original.
+        original = t.replace("’", "'")
+        for pat in patterns:
+            original = re.sub(pat, "", original, flags=re.IGNORECASE).strip()
+
+        # If the user only said the prefix ("my name is") we should treat it as missing.
+        if not normalized_stripped:
+            return ""
+
+        # Guard against accidental "names" that are just the prefix.
+        prefix_only = {
+            "my name is",
+            "my name's",
+            "this is",
+            "it's",
+            "it is",
+            "je m'appelle",
+            "j'm'appelle",
+            "mon nom est",
+            "c'est",
+        }
+        if normalized_stripped.strip(" .,!?:;-") in prefix_only:
+            return ""
+
+        # If they included extra details in the same breath ("... and my address is ..."),
+        # keep only the name fragment.
+        cut_markers = (
+            r"\b(and my address is|and my address|my address is|address is|address)\b",
+            r"\b(and my phone is|and my phone|my phone is|phone number is|phone)\b",
+            r"\b(and my email is|and my email|my email is|email)\b",
+            r"\b(et mon adresse|mon adresse|adresse)\b",
+            r"\b(et mon numero|et mon numéro|mon numero|mon numéro|telephone|téléphone)\b",
+            r"\b(et mon email|et mon courriel|mon email|mon courriel|courriel|email)\b",
+        )
+        normalized_name = normalized_stripped
+        for marker in cut_markers:
+            normalized_name = re.split(marker, normalized_name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+        original_name = original
+        for marker in cut_markers:
+            original_name = re.split(marker, original_name, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+        normalized_name = normalized_name.strip(" .,!?:;-")
+        original_name = original_name.strip(" .,!?:;-")
+
+        return original_name if original_name else normalized_name
 
     def _extract_spelled_name(self, text: str) -> str:
         """
@@ -578,13 +637,13 @@ class VoicePipeline:
 
         normalized = _normalize_for_intent(t)
         normalized = re.sub(
-            r"^(my name is|this is|it's|it is)\s+",
+            r"^(my name is|my name'?s|this is|it'?s|it is)\b[,:\-–—]?\s*",
             "",
             normalized,
             flags=re.IGNORECASE,
         )
         normalized = re.sub(
-            r"^(je m'appelle|mon nom est|c'est)\s+",
+            r"^(je m'appelle|j'm'appelle|mon nom est|c'?est)\b[,:\-–—]?\s*",
             "",
             normalized,
             flags=re.IGNORECASE,
@@ -830,9 +889,9 @@ class VoicePipeline:
             name = self._extract_name(transcript)
             if not name:
                 retry = (
-                    "Désolé, je n’ai pas bien compris. Quel est votre nom ?"
+                    "Pas de souci — quel nom dois-je utiliser pour la commande ? (Votre prénom suffit.)"
                     if language == "fr"
-                    else "Sorry—I didn’t catch that. What’s your name?"
+                    else "No worries—I didn’t catch that. What name should I use for the order? (First name is totally fine.)"
                 )
                 await self._speak_response(retry)
                 return True
@@ -848,7 +907,29 @@ class VoicePipeline:
             return True
 
         if self._checkout_phase == CheckoutPhase.NAME_CONFIRM:
-            if self._is_affirmative(transcript):
+            treat_as_affirmative = self._is_affirmative(transcript)
+            treat_as_negative = self._is_negative(transcript)
+
+            # If the caller responds with a corrected name instead of "yes/no", accept it.
+            if not treat_as_affirmative and not treat_as_negative:
+                candidate = self._extract_name(transcript)
+                if candidate:
+                    if (
+                        self._customer_name
+                        and candidate.casefold() == self._customer_name.casefold()
+                    ):
+                        treat_as_affirmative = True
+                    else:
+                        self._customer_name = candidate
+                        confirm = (
+                            f"Merci ! Donc {candidate}. C'est bien ça ?"
+                            if language == "fr"
+                            else f"Got it—so {candidate}. Is that right?"
+                        )
+                        await self._speak_response(confirm)
+                        return True
+
+            if treat_as_affirmative:
                 if self._customer_address:
                     spelled_number = self._spell_first_number(self._customer_address)
                     spelled_postal = self._spell_postal_code(self._customer_address)
@@ -894,7 +975,7 @@ class VoicePipeline:
                 await self._speak_response(ask)
                 return True
 
-            if self._is_negative(transcript):
+            if treat_as_negative:
                 self._checkout_phase = CheckoutPhase.NAME_SPELL
                 ask = (
                     "Pas de souci. Pouvez-vous l'épeler lettre par lettre, et dire « espace » entre le prénom et le nom ?"
@@ -905,9 +986,9 @@ class VoicePipeline:
                 return True
 
             reprompt = (
-                "Juste pour confirmer: est-ce que j'ai bien votre nom ? Oui ou non ?"
+                f"Juste pour être sûre : {self._customer_name}. C'est bien ça ? (Vous pouvez dire oui, ou me donner le bon nom.)"
                 if language == "fr"
-                else "Quick check—did I get your name right? Yes or no?"
+                else f"Just to make sure: {self._customer_name}. Is that right? (You can say yes, or tell me the correct name.)"
             )
             await self._speak_response(reprompt)
             return True
@@ -1306,7 +1387,9 @@ class VoicePipeline:
         metrics.update(
             {
                 "underflows": self._pacer_underruns,
+                "late_resets": self._pacer_late_resets,
                 "queue_depth_max": self._queue_depth_max,
+                "jitter_buffer_ms": self._jitter_buffer_ms,
                 "mark_rtt_ms": round(call_state.avg_mark_rtt_ms, 2) if call_state else 0.0,
             }
         )
@@ -1364,6 +1447,10 @@ class VoicePipeline:
 
         # Enter listening state immediately; we can greet even if STT has issues.
         self._state = PipelineState.LISTENING
+        now = time.time()
+        self._last_audio_frame_time = now
+        self._last_speech_activity_time = now
+        self._last_silence_prompt_time = 0.0
         logger.info(
             "Call started",
             call_sid=event.call_sid,
@@ -1419,8 +1506,8 @@ class VoicePipeline:
                     track=getattr(event, "track", None),
                 )
             await self._stt.send_audio(audio)
-            self._last_speech_time = time.time()
-            
+            self._last_audio_frame_time = time.time()
+             
             # Start silence detection if not already running
             if self._silence_task is None or self._silence_task.done():
                 self._silence_task = asyncio.create_task(self._silence_detector())
@@ -1433,6 +1520,8 @@ class VoicePipeline:
         """Handle VAD speech-start event from STT (used for barge-in)."""
         if not self._is_running:
             return
+
+        self._last_speech_activity_time = time.time()
         
         if self._state == PipelineState.SPEAKING:
             self._speech_started_during_tts = True
@@ -1450,6 +1539,7 @@ class VoicePipeline:
 
         if result.text and result.text.strip():
             self._last_stt_text_time = time.time()
+            self._last_speech_activity_time = time.time()
 
         if not self._logged_first_transcript and result.text:
             self._logged_first_transcript = True
@@ -1615,6 +1705,11 @@ class VoicePipeline:
         self._tts.cancel_current()
         tasks.append(asyncio.create_task(self._stop_pacer()))
         self._outbound_ulaw_remainder = b""
+
+        # Reset adaptive jitter buffer to the baseline after a hard barge-in so the next turn
+        # stays snappy; it will auto-increase again if underflows recur.
+        self._jitter_buffer_ms = self._jitter_buffer_base_ms
+        self._jitter_buffer_stable_bursts = 0
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1803,58 +1898,77 @@ class VoicePipeline:
 
         language = self._lang_state.current
         wants_menu = looks_like_menu_request(transcript, language=language)
-        matches = find_menu_items(catalog, transcript, limit=10) if not wants_menu else []
+        wants_full_menu = looks_like_full_menu_request(transcript, language=language)
+        section_hits = find_menu_sections(catalog, transcript, limit=2)
+        matches = find_menu_items(catalog, transcript, limit=10)
 
-        if language == "fr":
-            header = (
-                "CONTEXTE MENU (source: menu.html)\n"
-                "RÈGLES:\n"
-                "- Utilise uniquement les articles et prix listés ici.\n"
-                "- Aide l'appelant à choisir et à commander : demande la quantité, confirme ce que tu as noté, puis demande s'il veut autre chose.\n"
-                "- Quand l'appelant dit que c'est tout : passe au checkout (nom, adresse, téléphone, email). Confirme chaque info en la répétant/épelant puis demande si c'est correct.\n"
-                "- Adresse: épelle au moins le numéro et le code postal. Téléphone: répète les chiffres. Email: répète lentement et, si besoin, demande de l'épeler.\n"
-                "- Ne confirme la commande (prise/confirmée) qu'après avoir obtenu ET fait confirmer: nom, adresse, téléphone et email.\n"
-                "- Si l'appelant demande autre chose que le menu: réponds brièvement avec empathie, puis ramène doucement au menu.\n"
-                "- Réponses courtes, 1 question à la fois.\n"
-            )
-        else:
-            header = (
-                "MENU CONTEXT (source: menu.html)\n"
-                "RULES:\n"
-                "- Use only the items and prices listed here.\n"
-                "- Help the caller choose and place a (simulated) order: ask quantity, confirm what you recorded, then ask if they want anything else.\n"
-                "- When the caller says they're done: move to checkout (name, address, phone number, email). Confirm each by repeating/spelling it back and asking if it's correct.\n"
-                "- Address: spell at least the street number and postal code. Phone: repeat digits. Email: repeat slowly and ask them to spell it if needed.\n"
-                "- Do not confirm the order as taken/confirmed until you have AND confirmed: name, address, phone number, and email.\n"
-                "- If the caller asks about non-menu topics: respond briefly with empathy, then gently steer back to the menu.\n"
-                "- Keep it short and ask 1 question at a time.\n"
-            )
-
-        if self.config.menu_only:
-            menu_lines = "\n".join(catalog.to_prompt_lines())
-            logger.info("Menu context included", reason="menu_only", current_language=language)
-            return f"{header}\n{menu_lines}"
-
-        if not wants_menu and not matches:
+        # If we're not going to reference menu data this turn, don't inject it.
+        if not wants_menu and not wants_full_menu and not section_hits and not matches:
             return None
 
-        if wants_menu:
-            menu_lines = "\n".join(catalog.to_prompt_lines())
-            logger.info("Menu context included", reason="menu_request", current_language=language)
-            return f"{header}\n{menu_lines}"
+        sections_sorted = sorted(catalog.sections.keys())
+        section_list = "; ".join(sections_sorted)
 
-        # Only provide relevant matches to keep context small.
-        match_lines: List[str] = []
-        for item in matches:
-            match_lines.append(f"- {item.section}: {item.name} — {item.price_text}")
+        if language == "fr":
+            header = "DONNÉES MENU (source: menu.html)"
+            sections_header = f"SECTIONS: {section_list}"
+            matches_header = "ARTICLES PERTINENTS:"
+        else:
+            header = "MENU DATA (source: menu.html)"
+            sections_header = f"SECTIONS: {section_list}"
+            matches_header = "RELEVANT ITEMS:"
 
-        logger.info(
-            "Menu context included",
-            reason="menu_item_match",
-            current_language=language,
-            num_matches=len(matches),
-        )
-        return f"{header}\nMATCHES:\n" + "\n".join(match_lines)
+        lines: List[str] = [header, sections_header]
+
+        if wants_full_menu:
+            lines.extend(catalog.to_prompt_lines())
+            logger.info("Menu context included", reason="full_menu", current_language=language)
+            return "\n".join(lines)
+
+        added: int = 0
+        seen: set[tuple[str, str]] = set()
+
+        def add_item(item_section: str, item_name: str, item_price: str) -> None:
+            nonlocal added
+            key = (item_section, item_name)
+            if key in seen:
+                return
+            seen.add(key)
+            lines.append(f"- {item_section}: {item_name} — {item_price}")
+            added += 1
+
+        # If the caller mentions a section (e.g., "desserts"), include that section excerpt.
+        if section_hits:
+            for section in section_hits:
+                for item in catalog.sections.get(section, ()):
+                    add_item(item.section, item.name, item.price_text)
+                    if added >= 16:
+                        break
+                if added >= 16:
+                    break
+
+        # Otherwise, include direct item matches.
+        if matches and added < 16:
+            for item in matches:
+                add_item(item.section, item.name, item.price_text)
+                if added >= 16:
+                    break
+
+        if added > 0:
+            lines.insert(2, matches_header)
+            reason = "section_match" if section_hits else "menu_item_match"
+            logger.info(
+                "Menu context included",
+                reason=reason,
+                current_language=language,
+                num_items=added,
+                num_sections=len(section_hits),
+            )
+            return "\n".join(lines)
+
+        # Menu request without a specific section/item: provide sections only (small context).
+        logger.info("Menu context included", reason="menu_request", current_language=language)
+        return "\n".join(lines)
 
     async def _run_turn(self, queued: QueuedTranscript) -> None:
         """Run a single conversation turn from a final transcript."""
@@ -1909,88 +2023,133 @@ class VoicePipeline:
         self._pacer_running = True
         frame_duration = 0.020  # 20ms per frame
         next_send_time = time.time()
-        
-        # Pre-buffer to reduce bursty producer/consumer underruns
-        prebuffer_frames = max(3, int(self._jitter_buffer_ms / 20))
-        buffered = 0
-        frames_buffer = []
-        
+        frames_buffer: List[OutboundMessage] = []
+
+        need_prebuffer = True
+        audio_active = False
+        last_audio_sent_time = 0.0
+        burst_underflows = 0
+
+        def _tune_jitter_buffer(*, increase: bool, reason: str) -> None:
+            before = int(self._jitter_buffer_ms)
+            if increase:
+                bump = max(self._jitter_buffer_step_ms * 2, 40)
+                after = min(self._jitter_buffer_max_ms, before + bump)
+                self._jitter_buffer_stable_bursts = 0
+            else:
+                after = max(self._jitter_buffer_min_ms, before - self._jitter_buffer_step_ms)
+
+            if after != before:
+                self._jitter_buffer_ms = after
+                logger.info(
+                    "Adaptive jitter buffer tuned",
+                    before_ms=before,
+                    after_ms=after,
+                    reason=reason,
+                )
+
         try:
-            # Pre-buffer phase
-            while buffered < prebuffer_frames and self._pacer_running:
-                try:
-                    outbound = await asyncio.wait_for(
-                        self._outbound_queue.get(),
-                        timeout=0.5
-                    )
-                    if outbound is None:
-                        break
-                    frames_buffer.append(outbound)
-                    if outbound.pace:
-                        buffered += 1
-                except asyncio.TimeoutError:
-                    break
-            
             # Main pacing loop
             while self._pacer_running and self._is_running:
-                try:
-                    # Get frame from buffer or queue
-                    if frames_buffer:
-                        outbound = frames_buffer.pop(0)
+                # If we were playing audio and have gone idle long enough, end the burst so the
+                # next burst will prebuffer again.
+                now = time.time()
+                if (
+                    audio_active
+                    and not frames_buffer
+                    and self._outbound_queue.empty()
+                    and last_audio_sent_time
+                    and (now - last_audio_sent_time) * 1000 >= self._jitter_buffer_idle_threshold_ms
+                ):
+                    audio_active = False
+                    need_prebuffer = True
+                    if burst_underflows == 0:
+                        self._jitter_buffer_stable_bursts += 1
+                        if self._jitter_buffer_stable_bursts >= 3:
+                            _tune_jitter_buffer(increase=False, reason="stable")
+                            self._jitter_buffer_stable_bursts = 0
                     else:
-                        # Non-blocking get to maintain timing
-                        try:
-                            outbound = self._outbound_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            # No frame available, send silence to maintain timing
-                            outbound = None
-                    
-                    if outbound is None:
-                        # Check for new audio with small timeout
-                        try:
-                            outbound = await asyncio.wait_for(
-                                self._outbound_queue.get(),
-                                timeout=0.015  # Most of the 20ms window
-                            )
-                        except asyncio.TimeoutError:
-                            # Still no audio, continue loop
-                            await asyncio.sleep(0.005)
-                            continue
-                    
-                    if outbound is None:  # Poison pill
-                        break
+                        self._jitter_buffer_stable_bursts = 0
+                    burst_underflows = 0
 
-                    if not outbound.pace:
-                        # Control frames (mark/clear/etc.) should be sent immediately and must not
-                        # consume an audio pacing slot.
-                        await self._send_message(outbound.message)
+                # Get next message (prefer buffer).
+                outbound: Optional[OutboundMessage]
+                if frames_buffer:
+                    outbound = frames_buffer.pop(0)
+                else:
+                    try:
+                        outbound = self._outbound_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        outbound = None
+
+                if outbound is None:
+                    # No message ready. If we're in an active audio burst, this is an underflow
+                    # (the producer didn't stay ahead of the 20ms schedule).
+                    if audio_active:
+                        try:
+                            outbound = await asyncio.wait_for(self._outbound_queue.get(), timeout=0.020)
+                        except asyncio.TimeoutError:
+                            self._pacer_underruns += 1
+                            burst_underflows += 1
+                            _tune_jitter_buffer(increase=True, reason="underflow")
+                            next_send_time = time.time()
+                            continue
+                    else:
+                        await asyncio.sleep(0.01)
                         continue
-                    
-                    # Wait until next send time for precise 20ms intervals
-                    now = time.time()
-                    wait_time = next_send_time - now
-                    if wait_time > 0:
-                        await asyncio.sleep(wait_time)
-                    
-                    # Send frame
+
+                if outbound is None:  # Poison pill
+                    break
+
+                if not outbound.pace:
                     await self._send_message(outbound.message)
-                    
-                    # Calculate next send time (exactly 20ms later)
-                    next_send_time += frame_duration
-                    
-                    # If we're falling behind, reset timing
-                    if time.time() > next_send_time + 0.040:  # More than 2 frames behind
-                        self._pacer_underruns += 1
-                        if self._pacer_underruns % 10 == 0:
-                            logger.warning(
-                                "Audio pacer reset timing", 
-                                underruns=self._pacer_underruns,
-                                behind_ms=(time.time() - next_send_time)*1000
-                            )
-                        next_send_time = time.time()
-                        
-                except asyncio.TimeoutError:
-                    continue  # No audio available, keep waiting
+                    continue
+
+                # Start of a new audio burst: prebuffer some frames for smooth playback.
+                if need_prebuffer:
+                    prebuffer_frames = max(3, int(self._jitter_buffer_ms / 20))
+                    frames_buffer = [outbound]
+                    buffered_audio = 1
+                    prebuffer_deadline = time.time() + (self._jitter_buffer_ms / 1000.0) + 0.15
+                    while (
+                        buffered_audio < prebuffer_frames
+                        and self._pacer_running
+                        and self._is_running
+                        and time.time() < prebuffer_deadline
+                    ):
+                        try:
+                            nxt = await asyncio.wait_for(self._outbound_queue.get(), timeout=0.05)
+                        except asyncio.TimeoutError:
+                            break
+                        if nxt is None:
+                            break
+                        frames_buffer.append(nxt)
+                        if nxt.pace:
+                            buffered_audio += 1
+                    need_prebuffer = False
+                    audio_active = True
+                    next_send_time = time.time()
+                    continue
+
+                # Wait until next send time for precise 20ms intervals.
+                wait_time = next_send_time - now
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
+                await self._send_message(outbound.message)
+                last_audio_sent_time = time.time()
+                next_send_time += frame_duration
+
+                # If we're falling behind, reset timing (separate from underflows).
+                if time.time() > next_send_time + 0.040:  # More than 2 frames behind
+                    self._pacer_late_resets += 1
+                    if self._pacer_late_resets % 10 == 0:
+                        logger.warning(
+                            "Audio pacer reset timing",
+                            late_resets=self._pacer_late_resets,
+                            behind_ms=(time.time() - next_send_time) * 1000,
+                        )
+                    next_send_time = time.time()
                     
         except asyncio.CancelledError:
             pass
@@ -2205,9 +2364,17 @@ class VoicePipeline:
                 if self._state != PipelineState.LISTENING:
                     continue
                 
-                silence_duration = time.time() - self._last_speech_time
+                # Speech-aware silence: use VAD/transcript activity, not raw Twilio frames (which
+                # often continue even during silence).
+                now = time.time()
+                base = self._last_speech_activity_time or self._last_audio_frame_time or now
+                silence_duration = now - base
+                since_last_prompt = now - (self._last_silence_prompt_time or 0.0)
                 
-                if silence_duration > self.config.silence_timeout_seconds * 3:
+                if (
+                    silence_duration > self.config.silence_timeout_seconds * 3
+                    and since_last_prompt > self.config.silence_timeout_seconds * 3
+                ):
                     # Extended silence - prompt user
                     logger.debug("Extended silence detected")
                     prompt = (
@@ -2216,8 +2383,8 @@ class VoicePipeline:
                         else "Are you still there? Is there anything else I can help you with?"
                     )
                     await self._speak_response(prompt)
-                    self._last_speech_time = time.time()
-                    
+                    self._last_silence_prompt_time = now
+                     
         except asyncio.CancelledError:
             pass
     

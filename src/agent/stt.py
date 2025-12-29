@@ -36,6 +36,11 @@ USE_DEEPGRAM_V1_ONLY = os.getenv("USE_DEEPGRAM_V1_ONLY", "false").lower() == "tr
 # waste time retrying it every call.
 _DEEPGRAM_V2_DISABLED: bool = False
 
+# Some Deepgram accounts reject detect_language or language=multi (HTTP 400). Cache those
+# per-process too so calls don't hang while we try known-bad modes.
+_DEEPGRAM_DETECT_LANGUAGE_DISABLED: bool = False
+_DEEPGRAM_MULTI_DISABLED: bool = False
+
 
 @dataclass
 class TranscriptionResult:
@@ -115,6 +120,8 @@ class DeepgramSTT:
     async def connect(self) -> bool:
         """Connect to Deepgram streaming API."""
         global _DEEPGRAM_V2_DISABLED
+        global _DEEPGRAM_DETECT_LANGUAGE_DISABLED
+        global _DEEPGRAM_MULTI_DISABLED
         if self._is_connected:
             return True
         
@@ -125,9 +132,12 @@ class DeepgramSTT:
 
             # NOTE:
             # - We intentionally use Nova-3 only (latest) and do not fall back to older models.
-            # - Deepgram streaming currently rejects `detect_language=true` with Nova-3 on many
-            #   accounts (HTTP 400). For bilingual EN<->FR we use `language=multi` and perform
-            #   per-utterance language selection in the agent.
+            # - Not all Deepgram accounts support every "latest" streaming feature at once.
+            #   In particular, some accounts return HTTP 400 for:
+            #   - /v2/listen (Flux)
+            #   - detect_language=true (with Nova-3)
+            #   - language=multi (code-switching)
+            #   We keep calls working by trying the most capable mode first, then falling back.
             candidates: list[tuple[str, str]] = []
             model = "nova-3"
             common = (
@@ -140,33 +150,72 @@ class DeepgramSTT:
                 f"&smart_format=true"
             )
 
-            # Candidate 1: v2 (Flux) if supported by the account.
+            flux_params = (
+                f"&eager_eot_threshold={self.config.deepgram_eager_eot_threshold}"
+                f"&eot_threshold={self.config.deepgram_eot_threshold}"
+                f"&eot_timeout_ms={self.config.deepgram_eot_timeout_ms}"
+            )
+
+            # Candidate group: v2 (Flux) if supported by the account.
             if not USE_DEEPGRAM_V1_ONLY and not _DEEPGRAM_V2_DISABLED:
-                flux_params = (
-                    f"&eager_eot_threshold={self.config.deepgram_eager_eot_threshold}"
-                    f"&eot_threshold={self.config.deepgram_eot_threshold}"
-                    f"&eot_timeout_ms={self.config.deepgram_eot_timeout_ms}"
-                )
+                if not _DEEPGRAM_DETECT_LANGUAGE_DISABLED:
+                    candidates.append(
+                        (
+                            "v2_detect_language_nova-3",
+                            DEEPGRAM_V2_URL
+                            + common
+                            + "&vad_events=true"
+                            + "&detect_language=true"
+                            + flux_params,
+                        )
+                    )
+                if not _DEEPGRAM_MULTI_DISABLED:
+                    candidates.append(
+                        (
+                            "v2_nova-3_multi",
+                            DEEPGRAM_V2_URL
+                            + common
+                            + "&vad_events=true"
+                            + "&language=multi"
+                            + flux_params,
+                        )
+                    )
+                # Last-resort v2: no detect/multi (keeps call alive on strict accounts).
                 candidates.append(
                     (
-                        "v2_nova-3_multi",
-                        DEEPGRAM_V2_URL
-                        + common
-                        + "&vad_events=true"
-                        + "&language=multi"
-                        + flux_params,
+                        "v2_nova-3_default",
+                        DEEPGRAM_V2_URL + common + "&vad_events=true" + flux_params,
                     )
                 )
 
-            # Candidate 2: v1 fallback (widely supported).
+            # Candidate group: v1 fallback (widely supported).
+            if not _DEEPGRAM_DETECT_LANGUAGE_DISABLED:
+                candidates.append(
+                    (
+                        "v1_detect_language_nova-3",
+                        DEEPGRAM_V1_URL
+                        + common
+                        + "&vad_events=true"
+                        + "&endpointing=300"
+                        + "&detect_language=true",
+                    )
+                )
+            if not _DEEPGRAM_MULTI_DISABLED:
+                candidates.append(
+                    (
+                        "v1_nova-3_multi",
+                        DEEPGRAM_V1_URL
+                        + common
+                        + "&vad_events=true"
+                        + "&endpointing=300"
+                        + "&language=multi",
+                    )
+                )
+            # Last-resort v1: no detect/multi (keeps call alive on strict accounts).
             candidates.append(
                 (
-                    "v1_nova-3_multi",
-                    DEEPGRAM_V1_URL
-                    + common
-                    + "&vad_events=true"
-                    + "&endpointing=300"
-                    + "&language=multi",
+                    "v1_nova-3_default",
+                    DEEPGRAM_V1_URL + common + "&vad_events=true" + "&endpointing=300",
                 )
             )
 
@@ -186,12 +235,28 @@ class DeepgramSTT:
                 except Exception as e:
                     last_error = e
                     if (
-                        label.startswith("v2_")
+                        label == "v2_nova-3_default"
                         and type(e).__name__ in ("InvalidStatus", "InvalidStatusCode")
                         and "HTTP 400" in str(e)
                     ):
                         _DEEPGRAM_V2_DISABLED = True
                         logger.info("Deepgram v2 disabled (HTTP 400)", endpoint=label)
+                    if (
+                        "detect_language" in label
+                        and type(e).__name__ in ("InvalidStatus", "InvalidStatusCode")
+                        and "HTTP 400" in str(e)
+                    ):
+                        _DEEPGRAM_DETECT_LANGUAGE_DISABLED = True
+                        logger.info(
+                            "Deepgram detect_language disabled (HTTP 400)", endpoint=label
+                        )
+                    if (
+                        label.endswith("_multi")
+                        and type(e).__name__ in ("InvalidStatus", "InvalidStatusCode")
+                        and "HTTP 400" in str(e)
+                    ):
+                        _DEEPGRAM_MULTI_DISABLED = True
+                        logger.info("Deepgram language=multi disabled (HTTP 400)", endpoint=label)
                     logger.warning(
                         "Deepgram connection attempt failed",
                         endpoint=label,

@@ -1,8 +1,8 @@
 ================================================================================
 TWILIO VOICE AGENT - HOW EVERYTHING WORKS (Code-Accurate Walkthrough)
 ================================================================================
-Generated: 2025-12-28
-Code snapshot: git 8acf5fa (main)
+Generated: 2025-12-29
+Code snapshot: git HEAD (run `git rev-parse --short HEAD` for the exact hash)
 Repository path: C:\Users\hatem\Desktop\sems-main
   (This repo may also live at C:\Users\hatem\OneDrive\Desktop\sems-main; Desktop can be a junction.)
 
@@ -33,16 +33,14 @@ Python runtime
 
 Pinned vs unpinned dependencies
 -------------------------------
-requirements.txt pins a few performance-critical packages; most are “latest at install time”:
-- granian==1.6.3 (ASGI server used in production)
-- uvloop==0.21.0 (Linux only; Windows falls back to default asyncio loop)
-- msgspec==0.18.6 (fast JSON decode/encode for Twilio WS messages)
-- orjson==3.10.11 (FastAPI JSON responses)
+requirements.txt pins all direct dependencies so installs are stable across deploys.
+It does NOT pin transitive dependencies the way a full lockfile would.
 
 Dependency lock note (IMPORTANT for "exact versions")
 -----------------------------------------------------
-- This repo does NOT ship a lock file (no poetry.lock / requirements.lock / pip-tools lock).
-  That means many package versions are resolved at install/build time and can drift.
+- This repo uses a pinned `requirements.txt` for direct deps.
+- It does NOT ship a full lock file of transitive deps (no poetry.lock / requirements.lock / pip-tools lock).
+  That means transitive package versions can still drift over time.
 - To see the *exact* installed versions in a given environment, run:
   - python -m pip freeze
   - python -m pip show fastapi granian deepgram-sdk cartesia openai groq twilio websockets
@@ -50,28 +48,28 @@ Dependency lock note (IMPORTANT for "exact versions")
 requirements.txt (exact contents)
 ---------------------------------
 See requirements.txt in the repo root. As of this code snapshot it contains:
-- fastapi
+- fastapi==0.128.0
 - granian==1.6.3
 - uvloop==0.21.0; platform_system != "Windows"
 - msgspec==0.18.6
 - orjson==3.10.11
-- uvicorn[standard]
-- websockets
-- python-dotenv
-- httpx
-- twilio
-- deepgram-sdk
-- cartesia
-- openai
-- groq
-- instructor
-- pydantic
-- semantic-router[fastembed]
-- fastembed
-- aiofiles
-- structlog
-- pytest
-- pytest-asyncio
+- uvicorn[standard]==0.40.0
+- websockets==15.0.1
+- python-dotenv==1.2.1
+- httpx==0.28.1
+- twilio==9.9.0
+- deepgram-sdk==5.3.0
+- cartesia==2.0.17
+- openai==2.14.0
+- groq==1.0.0
+- instructor==1.13.0
+- pydantic==2.12.5
+- semantic-router[fastembed]==0.1.12
+- fastembed==0.3.6
+- aiofiles==24.1.0
+- structlog==25.5.0
+- pytest==9.0.2
+- pytest-asyncio==1.3.0
 
 Key service integrations (external “versions” / protocols)
 ----------------------------------------------------------
@@ -84,9 +82,10 @@ Key service integrations (external “versions” / protocols)
   - Model: nova-3 (kept “latest”; we do NOT downgrade the model)
   - Endpoint preference: /v2/listen (Flux) when supported by the Deepgram account
   - Fallback: /v1/listen when /v2 returns HTTP 400
-  - Language: uses `language=multi` (English/French code-switching), not `language=en|fr`
-    (Some accounts reject nova-3 with detect_language=true/Flux; this repo stays on nova-3 and
-     handles language switching in-app.)
+  - Language: tries these modes (in order), without pinning `language=en|fr`:
+    1) detect_language=true (best when supported)
+    2) language=multi (code-switching)
+    3) no detect/multi (last resort for strict accounts; language switching still works via text inference)
 
 - Cartesia TTS:
   - WebSocket API version: 2024-06-10 (see CARTESIA_API_VERSION in src/agent/tts.py)
@@ -224,7 +223,8 @@ Feature flags / behavior
 ------------------------
 - MENU_ONLY=true|false
   When true: agent only discusses the menu + simulated ordering.
-  Router is bypassed and the menu is injected into every LLM turn.
+  Router is bypassed and menu *data* is injected only when needed (menu request / section or item mention / full menu request),
+  to keep prompts small and latency low.
 
 - ROUTER_ENABLED=true|false
   Enables semantic routing + cached audio (only used when MENU_ONLY=false).
@@ -234,10 +234,13 @@ Feature flags / behavior
 
 - SILENCE_TIMEOUT_SECONDS (default 1.5)
   Used by a basic “are you still there?” silence detector.
-  Note: this is based on inbound media timing, not semantic “speech”.
+  Note: this is speech-aware (Deepgram VAD/transcript activity), not raw Twilio frame arrivals.
 
 - MIN_INTERRUPTION_WORDS (default 3)
   Barge-in word threshold (hard interrupt) when the agent is speaking.
+
+- JITTER_BUFFER_MS / JITTER_BUFFER_MIN_MS / JITTER_BUFFER_MAX_MS / JITTER_BUFFER_ADAPT_STEP_MS / JITTER_BUFFER_IDLE_THRESHOLD_MS
+  Outbound audio pacing knobs (prebuffer + adaptive tuning to reduce choppy playback on PSTN jitter).
 
 Complete environment variable reference (names + defaults)
 ----------------------------------------------------------
@@ -281,7 +284,7 @@ Deepgram STT
   Used only when /v2/listen is active.
 - DEEPGRAM_LANGUAGE_EN (default "en-US")
 - DEEPGRAM_LANGUAGE_FR (default "fr")
-  NOTE: The current STT connection uses language=multi, so these are not passed as query params.
+  NOTE: The current STT connection uses detect_language / language=multi (or no language param), so these are not passed as query params.
 
 Cartesia TTS
 ------------
@@ -311,6 +314,14 @@ Conversation + turn-taking knobs
 - MAX_HISTORY_TURNS (default 10)
 - SILENCE_TIMEOUT_SECONDS (default 1.5)
 - MIN_INTERRUPTION_WORDS (default 3)
+
+Audio pacing (outbound)
+-----------------------
+- JITTER_BUFFER_MS (default 160)
+- JITTER_BUFFER_MIN_MS (default 80)
+- JITTER_BUFFER_MAX_MS (default 300)
+- JITTER_BUFFER_ADAPT_STEP_MS (default 20)
+- JITTER_BUFFER_IDLE_THRESHOLD_MS (default 250)
 
 ================================================================================
 3) High-level runtime flow (from phone call to spoken response)
@@ -459,13 +470,21 @@ Connection strategy (Nova-3, prefer v2/Flux, fallback to v1)
 DeepgramSTT.connect():
 - Always uses model=nova-3 (no “older model fallback”).
 - Builds candidate URLs:
-  1) v2_nova-3_multi (wss://api.deepgram.com/v2/listen) unless:
+  1) v2_detect_language_nova-3 (wss://api.deepgram.com/v2/listen)
+  2) v2_nova-3_multi (wss://api.deepgram.com/v2/listen)
+  3) v2_nova-3_default (wss://api.deepgram.com/v2/listen)
+     Skipped entirely if:
      - USE_DEEPGRAM_V1_ONLY=true, or
-     - a previous v2 attempt failed with HTTP 400 (cached per process).
-  2) v1_nova-3_multi (wss://api.deepgram.com/v1/listen) fallback.
+     - a previous v2_nova-3_default attempt failed with HTTP 400 (cached per process).
+  4) v1_detect_language_nova-3 (wss://api.deepgram.com/v1/listen)
+  5) v1_nova-3_multi (wss://api.deepgram.com/v1/listen)
+  6) v1_nova-3_default (wss://api.deepgram.com/v1/listen)
 
-If v2 returns HTTP 400, stt.py logs “Deepgram v2 disabled (HTTP 400)” and stops trying it for
-the lifetime of that process (avoids slow retries on every call).
+If v2_nova-3_default returns HTTP 400, stt.py logs “Deepgram v2 disabled (HTTP 400)” and stops trying
+/v2 for the lifetime of that process (avoids slow retries on every call).
+
+If detect_language or language=multi returns HTTP 400, stt.py disables that mode for the lifetime of the
+process and falls back to the next candidate.
 
 Query params (current)
 ----------------------
@@ -478,7 +497,10 @@ Common:
 - interim_results=true
 - smart_format=true
 - vad_events=true
-- language=multi
+- Language mode (varies by candidate):
+  - detect_language=true OR
+  - language=multi OR
+  - (none)
 
 v1-only extras:
 - endpointing=300
@@ -573,11 +595,14 @@ get_menu_catalog() is lru_cached; it logs “Menu loaded” with num_items/num_s
 How the menu is provided to the LLM
 -----------------------------------
 In MENU_ONLY=true mode:
-- pipeline._build_extra_context() ALWAYS injects:
-  - deterministic “MENU CONTEXT / CONTEXTE MENU” rules
-  - the full menu listing from MenuCatalog.to_prompt_lines()
+- pipeline._build_extra_context() injects compact MENU DATA only when needed (to keep prompt size small):
+  - Always includes the full section list when injecting any menu data.
+  - Full listing only when the caller asks for the “full menu / tout le menu”.
+  - If the caller mentions a section: injects a small excerpt of that section.
+  - If the caller mentions an item: injects only the relevant matched items.
 
-This is what prevents the agent from hallucinating items/prices.
+The “menu-only” behavioral rules live in the main system prompt (src/agent/llm.py) so we avoid
+repeating long rule blocks every turn.
 
 ================================================================================
 10) LLM layer: src/agent/llm.py (Groq or OpenAI/ChatGPT)
@@ -666,9 +691,11 @@ Inbound audio (MEDIA)
 ---------------------
 - Audio is μ-law bytes from Twilio.
 - Sent directly to STT (no PCM conversion).
-- _last_speech_time is updated on every inbound media frame (including silence frames).
-- A silence detector prompts after ~3 * SILENCE_TIMEOUT_SECONDS while LISTENING
-  (in practice: “no inbound media”, not “no speech”).
+- pipeline tracks two clocks:
+  - last_audio_frame_time: transport timing (Twilio frames)
+  - last_speech_activity_time: semantic speech activity (Deepgram VAD + any transcript text)
+- The silence detector uses last_speech_activity_time, so “are you still there?” is based on real speech,
+  not on raw Twilio frame arrivals.
 
 Turn start (final transcript)
 -----------------------------
@@ -691,6 +718,7 @@ When MENU_ONLY=true, pipeline tries _handle_checkout_flow(transcript) before rou
   - an email
 - Confirms each piece of info:
   - Name: repeat it back; if user says it's wrong, ask them to spell it letter-by-letter (say "space/espace" between first/last), then confirm and pronounce it
+    - Important edge case: if STT finalizes a prefix alone (e.g., "my name is" with no name yet), it is treated as missing and the agent asks again.
   - Address: spells at least street number + postal code (when detected)
   - Phone: repeats digits
   - Email: repeats slowly with AT/DOT (or AROBAS/POINT in French)
@@ -713,13 +741,18 @@ _speak_response(text):
 Outbound audio pacer (timing + buffering)
 -----------------------------------------
 - Sends exactly 1 audio frame every 20 ms.
-- Prebuffers up to max(3, jitter_buffer_ms/20) paced frames before starting:
-  - jitter_buffer_ms default is 100 ms -> 5 frames
+- Prebuffers up to max(3, jitter_buffer_ms/20) paced frames at the start of each outbound “audio burst”:
+  - jitter_buffer_ms default is 160 ms -> 8 frames
+- Adaptive tuning:
+  - If the pacer detects underflows mid-burst, it increases jitter_buffer_ms (up to JITTER_BUFFER_MAX_MS).
+  - After multiple stable bursts with no underflows, it decreases jitter_buffer_ms (down to JITTER_BUFFER_MIN_MS).
 - Control messages (mark/clear) are sent immediately (not paced).
-- If the pacer falls behind by >40 ms, it increments an underrun counter and resets timing.
+- If the pacer falls behind by >40 ms, it increments a late-reset counter and resets timing.
 - On pipeline stop, it logs:
-  - underflows (pacer underruns)
+  - underflows
+  - late_resets
   - queue_depth_max
+  - jitter_buffer_ms (final tuned value)
   - mark_rtt_ms (average)
 
 ================================================================================
@@ -763,7 +796,7 @@ Twilio transport timing
 -----------------------
 - Inbound media arrives as 20 ms frames. Network jitter affects when frames arrive.
 - Outbound playback is affected by:
-  - your pacer prebuffer (default 100 ms)
+  - your pacer prebuffer (default 160 ms, adaptive)
   - Twilio’s internal buffer
   - phone/PSTN jitter
 
@@ -787,7 +820,7 @@ LLM timing
 pipeline TurnMetrics captures:
 - llm_first_token_ms (time to first streamed token)
 - llm_total_ms (time until stream ends)
-LLM speed depends on provider, model, network, and prompt size (menu-only injects full menu).
+LLM speed depends on provider, model, network, and prompt size (menu-only injects compact menu data only when needed).
 
 TTS timing
 ----------

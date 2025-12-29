@@ -287,6 +287,68 @@ def find_menu_items(catalog: MenuCatalog, query: str, *, limit: int = 12) -> Lis
     return [item for _, item in scored[:limit]]
 
 
+def find_menu_sections(catalog: MenuCatalog, query: str, *, limit: int = 3) -> List[str]:
+    """
+    Find likely menu sections mentioned in the user's query.
+
+    Returns section names ordered by match strength.
+    """
+    q = _normalize(query)
+    if not q:
+        return []
+
+    q_tokens = set(q.split())
+    if not q_tokens:
+        return []
+
+    scored: List[Tuple[int, str]] = []
+    for section_name in catalog.sections.keys():
+        section_n = _normalize(section_name)
+        section_tokens = set(section_n.split())
+        overlap = len(q_tokens & section_tokens)
+        if overlap <= 0:
+            continue
+
+        score = overlap
+        if section_n and section_n in q:
+            score += 3
+        scored.append((score, section_name))
+
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [name for _, name in scored[:limit]]
+
+
+def looks_like_full_menu_request(text: str, *, language: str = "en") -> bool:
+    """
+    Heuristic: user wants the full menu listing (not just a section or a few items).
+    """
+    t = _normalize(text)
+    if not t:
+        return False
+
+    if language.strip().lower().startswith("fr"):
+        keywords = [
+            "tout le menu",
+            "menu complet",
+            "liste complete",
+            "liste complète",
+            "toute la liste",
+            "tous les articles",
+        ]
+    else:
+        keywords = [
+            "full menu",
+            "the full menu",
+            "entire menu",
+            "whole menu",
+            "all items",
+            "everything on the menu",
+            "list everything",
+        ]
+
+    return any(k in t for k in keywords)
+
+
 def looks_like_menu_request(text: str, *, language: str = "en") -> bool:
     """
     Lightweight heuristic to decide whether we should include menu context for the LLM.
@@ -310,6 +372,9 @@ def looks_like_menu_request(text: str, *, language: str = "en") -> bool:
             "dessert",
             "je vais prendre",
             "je veux",
+            "recommande",
+            "suggestion",
+            "populaire",
         ]
     else:
         keywords = [
@@ -323,7 +388,9 @@ def looks_like_menu_request(text: str, *, language: str = "en") -> bool:
             "how much is",
             "drink",
             "dessert",
+            "recommend",
+            "suggest",
+            "popular",
         ]
 
     return any(k in t for k in keywords)
-

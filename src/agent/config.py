@@ -78,6 +78,15 @@ class Config:
     max_history_turns: int = 10
     silence_timeout_seconds: float = 1.5
     min_interruption_words: int = 3
+
+    # Audio pacing / jitter buffer (Twilio PSTN is jittery; this smooths outbound playback)
+    # - jitter_buffer_ms: initial target prebuffer before starting an audio burst
+    # - adaptive tuning will raise/lower within [min,max] based on underflows
+    jitter_buffer_ms: int = 160
+    jitter_buffer_min_ms: int = 80
+    jitter_buffer_max_ms: int = 300
+    jitter_buffer_adapt_step_ms: int = 20
+    jitter_buffer_idle_threshold_ms: int = 250
     
     @property
     def ws_url(self) -> str:
@@ -147,6 +156,11 @@ class Config:
             outlines_enabled=self.outlines_enabled,
             agent_name=self.agent_name,
             min_interruption_words=self.min_interruption_words,
+            jitter_buffer_ms=self.jitter_buffer_ms,
+            jitter_buffer_min_ms=self.jitter_buffer_min_ms,
+            jitter_buffer_max_ms=self.jitter_buffer_max_ms,
+            jitter_buffer_adapt_step_ms=self.jitter_buffer_adapt_step_ms,
+            jitter_buffer_idle_threshold_ms=self.jitter_buffer_idle_threshold_ms,
             twilio_sid_prefix=self.twilio_account_sid[:6] + "..." if self.twilio_account_sid else "NOT SET",
             deepgram_key_set=bool(self.deepgram_api_key),
             cartesia_key_set=bool(self.cartesia_api_key),
@@ -234,6 +248,13 @@ def get_config() -> Config:
         max_history_turns=_get_int("MAX_HISTORY_TURNS", 10),
         silence_timeout_seconds=_get_float("SILENCE_TIMEOUT_SECONDS", 1.5),
         min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 3),
+
+        # Audio pacing / jitter buffer
+        jitter_buffer_ms=_get_int("JITTER_BUFFER_MS", 160),
+        jitter_buffer_min_ms=_get_int("JITTER_BUFFER_MIN_MS", 80),
+        jitter_buffer_max_ms=_get_int("JITTER_BUFFER_MAX_MS", 300),
+        jitter_buffer_adapt_step_ms=_get_int("JITTER_BUFFER_ADAPT_STEP_MS", 20),
+        jitter_buffer_idle_threshold_ms=_get_int("JITTER_BUFFER_IDLE_THRESHOLD_MS", 250),
     )
     
     return config

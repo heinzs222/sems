@@ -8,7 +8,9 @@ from src.agent.menu import (
     load_menu_from_html,
     resolve_menu_path,
     looks_like_menu_request,
+    looks_like_full_menu_request,
     find_menu_items,
+    find_menu_sections,
 )
 
 
@@ -38,4 +40,16 @@ def test_find_menu_items_matches_name_tokens() -> None:
 
     matches = find_menu_items(catalog, "I want a taro milk tea", limit=5)
     assert any(item.name == "Taro" for item in matches)
+
+
+def test_find_menu_sections_matches_section_tokens() -> None:
+    catalog = load_menu_from_html(resolve_menu_path("menu.html"))
+
+    assert find_menu_sections(catalog, "tiramisu", limit=1) == ["Tiramisu"]
+    assert find_menu_sections(catalog, "boissons", limit=1) == ["Boissons"]
+
+
+def test_looks_like_full_menu_request_keywords() -> None:
+    assert looks_like_full_menu_request("Can I get the full menu?", language="en") is True
+    assert looks_like_full_menu_request("tout le menu", language="fr") is True
 
