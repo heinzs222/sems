@@ -683,14 +683,14 @@ Why “is_final OR speech_final” matters:
 Menu-only checkout flow (deterministic)
 ---------------------------------------
 When MENU_ONLY=true, pipeline tries _handle_checkout_flow(transcript) before routing/LLM:
-- ORDERING -> NAME -> NAME_CONFIRM -> ADDRESS -> ADDRESS_CONFIRM -> PHONE -> PHONE_CONFIRM -> EMAIL -> EMAIL_CONFIRM -> COMPLETE
+- ORDERING -> NAME -> NAME_CONFIRM -> (NAME_SPELL if user says it's wrong) -> ADDRESS -> ADDRESS_CONFIRM -> PHONE -> PHONE_CONFIRM -> EMAIL -> EMAIL_CONFIRM -> COMPLETE
 - Starts checkout when the caller says “that’s all / c’est tout” OR starts giving:
   - a name (“my name is…”, “je m’appelle…”) OR
   - an address (postal code / “address/adresse”) OR
   - a phone number OR
   - an email
-- Spells and confirms each piece of info:
-  - Name: letter-by-letter
+- Confirms each piece of info:
+  - Name: repeat it back; if user says it's wrong, ask them to spell it letter-by-letter (say "space/espace" between first/last), then confirm and pronounce it
   - Address: spells at least street number + postal code (when detected)
   - Phone: repeats digits
   - Email: repeats slowly with AT/DOT (or AROBAS/POINT in French)

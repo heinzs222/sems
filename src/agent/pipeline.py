@@ -141,6 +141,34 @@ _HANGUP_NOW_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 _CA_POSTAL_RE = re.compile(r"\b([a-z]\d[a-z])\s?(\d[a-z]\d)\b", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
+_LOG_PHONE_RE = re.compile(
+    r"(?:\+?1[\s\-.]?)?(?:\(?\d{3}\)?[\s\-.]?)\d{3}[\s\-.]?\d{4}"
+)
+
+
+def _redact_transcript_for_logs(text: str) -> str:
+    """
+    Best-effort redaction for logs (to reduce accidental PII exposure).
+
+    This is not a compliance-grade scrubber; it masks common patterns:
+    - emails -> [EMAIL]
+    - phone numbers -> [PHONE-***1234]
+    - Canadian postal codes -> A1A ***
+    """
+    if not text:
+        return ""
+
+    redacted = _EMAIL_RE.sub("[EMAIL]", text)
+
+    def _mask_phone(match: re.Match[str]) -> str:
+        digits = re.sub(r"\D+", "", match.group(0) or "")
+        last4 = digits[-4:] if len(digits) >= 4 else digits
+        return f"[PHONE-***{last4}]"
+
+    redacted = _LOG_PHONE_RE.sub(_mask_phone, redacted)
+    redacted = _CA_POSTAL_RE.sub(lambda m: f"{m.group(1).upper()} ***", redacted)
+    return redacted
+
 _BARGE_IN_BACKCHANNEL_RE = re.compile(
     r"^(ok|okay|yeah|yep|yup|uh huh|uh-huh|mhm|mm hmm|mm-hmm|oui|ouais|d['’]accord|daccord)([.!?])?$"
 )
@@ -1500,7 +1528,11 @@ class VoicePipeline:
             
             logger.info(
                 "Final transcript",
-                text=transcript[:100],
+                call_sid=self.call_sid,
+                stream_sid=self.stream_sid,
+                menu_only=self.config.menu_only,
+                checkout_phase=str(self._checkout_phase),
+                text=_redact_transcript_for_logs(transcript)[:100],
                 speech_final=result.speech_final,
             )
             await self._turn_queue.put(
@@ -1652,7 +1684,16 @@ class VoicePipeline:
         )
 
         # Menu-only checkout flow: name/address confirmation (with spelling).
+        checkout_phase_before = self._checkout_phase
         if await self._handle_checkout_flow(transcript):
+            logger.info(
+                "Routing decision",
+                call_sid=self.call_sid,
+                menu_only=self.config.menu_only,
+                checkout_phase=str(checkout_phase_before),
+                decision="checkout",
+                next_checkout_phase=str(self._checkout_phase),
+            )
             return
         
         # Try semantic routing first
@@ -1680,6 +1721,13 @@ class VoicePipeline:
                 return
         
         # Fall back to LLM
+        logger.info(
+            "Routing decision",
+            call_sid=self.call_sid,
+            menu_only=self.config.menu_only,
+            checkout_phase=str(self._checkout_phase),
+            decision="llm",
+        )
         await self._generate_llm_response(transcript)
     
     async def _generate_llm_response(self, transcript: str) -> None:
