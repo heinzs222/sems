@@ -329,7 +329,7 @@ BARGE-IN (INTERRUPTION)
 
 When the agent is speaking and the caller starts talking:
 1. Deepgram detects speech
-2. If word count >= MIN_INTERRUPTION_WORDS (default: 3)
+2. If word count >= MIN_INTERRUPTION_WORDS (default: 2)
 3. Server cancels TTS synthesis
 4. Server sends "clear" event to Twilio (stops audio playback)
 5. New transcript processed as next turn
@@ -361,13 +361,13 @@ DEEPGRAM STT (src/agent/stt.py):
 SAMPLE RATES:
 -------------
 - TWILIO_SAMPLE_RATE = 8000 Hz     # Twilio audio (telephone quality)
-- STT_SAMPLE_RATE = 16000 Hz       # Deepgram input requirement
-- CARTESIA_SAMPLE_RATE = 22050 Hz  # Cartesia TTS output
+- STT_SAMPLE_RATE = 8000 Hz        # Deepgram receives mu-law 8kHz directly (no resampling)
+- CARTESIA_SAMPLE_RATE = 8000 Hz   # Cartesia returns 8kHz PCM (then converted to mu-law 8kHz)
 
 INTERRUPTION DETECTION:
 -----------------------
-- MIN_INTERRUPTION_WORDS = 3       # Configurable in .env
-  (Caller must speak 3+ words to interrupt the agent)
+- MIN_INTERRUPTION_WORDS = 2       # Configurable in .env
+  (Caller must speak 2+ words to interrupt the agent)
 
 To modify timing, edit the values in:
 - src/agent/stt.py (lines ~96-107) for Deepgram settings
@@ -395,7 +395,7 @@ API Keys:
 Agent Behavior:
 - AGENT_NAME=Sesame            # Agent's name
 - COMPANY_NAME=Sesame AI       # Company name
-- MIN_INTERRUPTION_WORDS=3     # Words needed to interrupt
+- MIN_INTERRUPTION_WORDS=2     # Words needed to interrupt
 
 Features:
 - ROUTER_ENABLED=true          # Enable semantic routing

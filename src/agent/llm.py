@@ -116,8 +116,10 @@ PRISE DE COMMANDE:
 
 STYLE:
 - Réponses courtes (souvent 1 à 2 phrases) car c'est de l'audio.
+- Commence la plupart des réponses par un bref accusé de réception ("D'accord.", "Parfait.") sans le répéter systématiquement.
 - Sonne humain: petites réactions naturelles ("Parfait!", "Super!") sans en faire trop.
 - Ton léger et aidant (pas autoritaire).
+- Utilise la ponctuation (—, …) pour de petites pauses naturelles, surtout pour les confirmations et l'épellation.
 - Va droit au but (n'ouvre pas chaque réponse par "Bien sûr!").
 - N'invente jamais d'articles ou de prix qui ne sont pas dans le menu."""
 
@@ -148,8 +150,10 @@ ORDER TAKING:
 
 STYLE:
 - Keep responses short (often 1-2 sentences) because this is spoken audio.
+- Start most replies with a brief acknowledgement ("Got it.", "Perfect.") without repeating it every time.
 - Sound human: quick, friendly reactions ("Perfect!", "Awesome!") without overdoing it.
 - Light, helpful tone (never pushy or overly firm).
+- Use punctuation (—, …) for natural micro-pauses, especially during confirmations and spelling.
 - Start responses directly (no "Sure!" / "Of course!" openings).
 - Never invent menu items or prices that aren't in the provided menu."""
 
@@ -318,16 +322,12 @@ class GroqLLM:
         Yields:
             Text chunks as they're generated
         """
-        system_prompt = get_system_prompt(self.config, target_language=target_language or "en")
-
-        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
-        if extra_context:
-            messages.append({"role": "system", "content": extra_context})
-
-        if include_history:
-            messages.extend(self._history.get_messages())
-
-        messages.append({"role": "user", "content": user_message})
+        messages = self._build_messages(
+            user_message=user_message,
+            target_language=target_language,
+            include_history=include_history,
+            extra_context=extra_context,
+        )
         self._history.add_user_message(user_message)
 
         try:
@@ -359,6 +359,39 @@ class GroqLLM:
             )
             self._history.add_assistant_message(error_msg)
             yield error_msg
+
+    async def generate_streaming_ephemeral(
+        self,
+        user_message: str,
+        *,
+        target_language: Optional[str] = None,
+        include_history: bool = True,
+        extra_context: Optional[str] = None,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Generate a streaming response without mutating conversation history.
+
+        Useful for speculative generation during Flux EagerEndOfTurn. Callers are
+        expected to commit the turn manually if/when the output is used.
+        """
+        messages = self._build_messages(
+            user_message=user_message,
+            target_language=target_language,
+            include_history=include_history,
+            extra_context=extra_context,
+        )
+
+        stream = await self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            max_tokens=256,
+            temperature=0.7,
+        )
+
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
 
     async def generate(
         self,
@@ -396,8 +429,33 @@ class GroqLLM:
     def clear_history(self) -> None:
         self._history.clear()
 
+    def commit_turn(self, *, user_message: str, assistant_message: str) -> None:
+        """Commit a user+assistant exchange to history (used for speculative turns)."""
+        self._history.add_user_message(user_message)
+        self._history.add_assistant_message(assistant_message)
+
     def get_history_messages(self) -> List[Dict[str, str]]:
         return self._history.get_messages()
+
+    def _build_messages(
+        self,
+        *,
+        user_message: str,
+        target_language: Optional[str],
+        include_history: bool,
+        extra_context: Optional[str],
+    ) -> List[Dict[str, str]]:
+        system_prompt = get_system_prompt(self.config, target_language=target_language or "en")
+
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        if extra_context:
+            messages.append({"role": "system", "content": extra_context})
+
+        if include_history:
+            messages.extend(self._history.get_messages())
+
+        messages.append({"role": "user", "content": user_message})
+        return messages
 
 
 def create_llm(config: Optional[Any] = None) -> GroqLLM:

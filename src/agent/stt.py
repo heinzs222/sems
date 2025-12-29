@@ -83,6 +83,8 @@ class DeepgramSTT:
         self,
         on_transcript: Optional[Callable[[TranscriptionResult], Awaitable[None]]] = None,
         on_speech_started: Optional[Callable[[], Awaitable[None]]] = None,
+        on_eager_end_of_turn: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_turn_resumed: Optional[Callable[[], Awaitable[None]]] = None,
         language: Optional[str] = None,
         config: Optional[Any] = None,
     ):
@@ -93,6 +95,8 @@ class DeepgramSTT:
         self.language = language or getattr(config, "deepgram_language_en", "en-US")
         self._on_transcript = on_transcript
         self._on_speech_started = on_speech_started
+        self._on_eager_end_of_turn = on_eager_end_of_turn
+        self._on_turn_resumed = on_turn_resumed
         self._ws = None
         self._is_connected = False
         self._metrics = STTMetrics()
@@ -378,8 +382,8 @@ class DeepgramSTT:
             
             # Track word count
             self._word_count = len(transcript.split())
-            if is_final:
-                self._current_transcript = transcript
+            # Keep the latest transcript (interim or final) so Flux turn events can reference it.
+            self._current_transcript = transcript
             
             # Calculate latency
             latency_ms = 0.0
@@ -429,9 +433,13 @@ class DeepgramSTT:
 
         elif msg_type_norm in ("eagerendofturn", "eager_end_of_turn", "eager-end-of-turn"):
             logger.debug("Flux eager end of turn")
+            if self._on_eager_end_of_turn:
+                await self._on_eager_end_of_turn(self._current_transcript or "")
 
         elif msg_type_norm in ("turnresumed", "turn_resumed", "turn-resumed"):
             logger.debug("Flux turn resumed")
+            if self._on_turn_resumed:
+                await self._on_turn_resumed()
             
         elif msg_type_norm == "error":
             logger.error(
@@ -498,6 +506,8 @@ class STTManager:
         self._stt: Optional[DeepgramSTT] = None
         self._transcript_callback: Optional[Callable[[TranscriptionResult], Awaitable[None]]] = None
         self._speech_started_callback: Optional[Callable[[], Awaitable[None]]] = None
+        self._eager_end_of_turn_callback: Optional[Callable[[str], Awaitable[None]]] = None
+        self._turn_resumed_callback: Optional[Callable[[], Awaitable[None]]] = None
     
     def set_transcript_callback(
         self, 
@@ -510,6 +520,18 @@ class STTManager:
         callback: Callable[[], Awaitable[None]],
     ) -> None:
         self._speech_started_callback = callback
+
+    def set_eager_end_of_turn_callback(
+        self,
+        callback: Callable[[str], Awaitable[None]],
+    ) -> None:
+        self._eager_end_of_turn_callback = callback
+
+    def set_turn_resumed_callback(
+        self,
+        callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._turn_resumed_callback = callback
     
     async def start(self, language: Optional[str] = None) -> bool:
         return await self.restart(language=language)
@@ -526,6 +548,8 @@ class STTManager:
             self._stt = DeepgramSTT(
                 on_transcript=self._transcript_callback,
                 on_speech_started=self._speech_started_callback,
+                on_eager_end_of_turn=self._eager_end_of_turn_callback,
+                on_turn_resumed=self._turn_resumed_callback,
                 language=language,
             )
             return await self._stt.connect()
@@ -534,6 +558,8 @@ class STTManager:
         candidate = DeepgramSTT(
             on_transcript=self._transcript_callback,
             on_speech_started=self._speech_started_callback,
+            on_eager_end_of_turn=self._eager_end_of_turn_callback,
+            on_turn_resumed=self._turn_resumed_callback,
             language=language,
         )
         

@@ -203,9 +203,9 @@ GET /models on the chosen provider.
 
 Deepgram Flux (v2) tuning + forcing v1
 --------------------------------------
-- DEEPGRAM_EAGER_EOT_THRESHOLD (default 0.38)
-- DEEPGRAM_EOT_THRESHOLD (default 0.74)
-- DEEPGRAM_EOT_TIMEOUT_MS (default 6500)
+- DEEPGRAM_EAGER_EOT_THRESHOLD (default 0.45)
+- DEEPGRAM_EOT_THRESHOLD (default 0.72)
+- DEEPGRAM_EOT_TIMEOUT_MS (default 4500)
   These are used only if your Deepgram account accepts /v2/listen.
 
 - USE_DEEPGRAM_V1_ONLY=true
@@ -236,7 +236,7 @@ Feature flags / behavior
   Used by a basic “are you still there?” silence detector.
   Note: this is speech-aware (Deepgram VAD/transcript activity), not raw Twilio frame arrivals.
 
-- MIN_INTERRUPTION_WORDS (default 3)
+- MIN_INTERRUPTION_WORDS (default 2)
   Barge-in word threshold (hard interrupt) when the agent is speaking.
 
 - JITTER_BUFFER_MS / JITTER_BUFFER_MIN_MS / JITTER_BUFFER_MAX_MS / JITTER_BUFFER_ADAPT_STEP_MS / JITTER_BUFFER_IDLE_THRESHOLD_MS
@@ -278,9 +278,9 @@ Deepgram STT
 - DEEPGRAM_API_KEY (required)
 - USE_DEEPGRAM_V1_ONLY (default false)
   Skips trying /v2/listen (Flux) and goes straight to /v1/listen.
-- DEEPGRAM_EAGER_EOT_THRESHOLD (default 0.38)
-- DEEPGRAM_EOT_THRESHOLD (default 0.74)
-- DEEPGRAM_EOT_TIMEOUT_MS (default 6500)
+- DEEPGRAM_EAGER_EOT_THRESHOLD (default 0.45)
+- DEEPGRAM_EOT_THRESHOLD (default 0.72)
+- DEEPGRAM_EOT_TIMEOUT_MS (default 4500)
   Used only when /v2/listen is active.
 - DEEPGRAM_LANGUAGE_EN (default "en-US")
 - DEEPGRAM_LANGUAGE_FR (default "fr")
@@ -313,7 +313,7 @@ Conversation + turn-taking knobs
 --------------------------------
 - MAX_HISTORY_TURNS (default 10)
 - SILENCE_TIMEOUT_SECONDS (default 1.5)
-- MIN_INTERRUPTION_WORDS (default 3)
+- MIN_INTERRUPTION_WORDS (default 2)
 
 Audio pacing (outbound)
 -----------------------
@@ -521,7 +521,8 @@ stt.py handles (best effort):
 - type=Results: transcript, confidence, is_final, speech_final
 - type=SpeechStarted: used for barge-in soft interrupt
 - type=UtteranceEnd: end-of-turn hint
-- type=EagerEndOfTurn / TurnResumed: Flux turn-taking signals (logged as debug)
+- type=EagerEndOfTurn: Flux turn-taking signal used to start speculative (ephemeral) LLM work during a pause
+- type=TurnResumed: Flux signal used to cancel speculative LLM if the caller keeps talking
 
 Language detection fields
 -------------------------
@@ -541,9 +542,18 @@ pipeline.py chooses language per “final transcript” using:
 2) Deepgram-provided detected_language/language_confidence (when present)
 3) Fallback: infer_language_from_text() (lightweight text heuristic)
 
-Stabilization rules (LangState)
--------------------------------
-To prevent language “flapping” on short utterances:
+Reply language (what the caller hears)
+--------------------------------------
+pipeline.py computes a per-turn reply_language (logged) and uses it for:
+- LLM TARGET_LANGUAGE (system prompt) for that turn
+- Cartesia voice selection for that turn
+- deterministic checkout prompts
+It follows the detected language immediately for meaningful utterances (including short greetings) without announcing
+the switch, unless the caller explicitly requested a language.
+
+Stable language (LangState.current)
+----------------------------------
+LangState.current still uses stabilization to prevent language “flapping” on short utterances:
 - confidence threshold: 0.75
 - require 2 consecutive eligible final transcripts to switch
 - ignore very short transcripts (<12 chars)
@@ -566,6 +576,7 @@ pipeline logs “Language decision” with:
 - detected_language
 - language_confidence
 - current_language
+- reply_language
 - switched (bool)
 - reason (override/stabilized/None)
 - detection_source (deepgram/text)
@@ -718,7 +729,7 @@ When MENU_ONLY=true, pipeline tries _handle_checkout_flow(transcript) before rou
   - an email
 - Confirms each piece of info:
   - Name: repeat it back; if user says it's wrong, ask them to spell it letter-by-letter (say "space/espace" between first/last), then confirm and pronounce it
-    - Important edge case: if STT finalizes a prefix alone (e.g., "my name is" with no name yet), it is treated as missing and the agent asks again.
+    - Important edge case: if STT finalizes a prefix alone (e.g., "my name is" with no name yet), the pipeline holds it ~350ms to concatenate the next final; if nothing arrives, it is treated as missing and the agent asks again.
   - Address: spells at least street number + postal code (when detected)
   - Phone: repeats digits
   - Email: repeats slowly with AT/DOT (or AROBAS/POINT in French)
@@ -729,8 +740,9 @@ When MENU_ONLY=true, pipeline tries _handle_checkout_flow(transcript) before rou
 Speaking (TTS) and marks
 ------------------------
 _speak_response(text):
-- waits briefly for STT to go quiet before speaking (min 250 ms, max 1200 ms)
+- waits briefly for STT to go quiet before speaking (min 250 ms for menu/help, 350 ms for checkout/repair; max 1200 ms)
   to avoid talking over the caller when endpointing emits early finals
+- applies a lightweight tone layer (ToneMode) that adds short acknowledgements + micro-pauses (without being too firm)
 - splits text into sentence-ish segments
 - for each segment:
   - streams Cartesia TTS

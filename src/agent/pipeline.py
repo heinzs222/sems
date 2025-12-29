@@ -48,6 +48,7 @@ from src.agent.language import (
     detect_language_override,
     detect_language_switch_command,
     infer_language_from_text,
+    normalize_detected_language,
     LangState,
     LanguageCode,
 )
@@ -85,6 +86,13 @@ class CheckoutPhase(str, Enum):
     EMAIL = "email"
     EMAIL_CONFIRM = "email_confirm"
     COMPLETE = "complete"
+
+
+class ToneMode(str, Enum):
+    GREETING = "greeting"
+    MENU_HELP = "menu_help"
+    CHECKOUT_CAPTURE = "checkout_capture"
+    REPAIR = "repair"
 
 
 def _normalize_for_intent(text: str) -> str:
@@ -253,6 +261,37 @@ class OutboundMessage:
     pace: bool = True  # True for 20ms media frames; False for control (mark/clear/etc.)
 
 
+@dataclass
+class SpeculativeLLMState:
+    """
+    Speculative (ephemeral) LLM generation started on Flux EagerEndOfTurn.
+
+    This is used to reduce perceived latency by beginning LLM work during a pause
+    and cancelling if Flux reports TurnResumed (user keeps talking).
+    """
+
+    transcript: str
+    transcript_norm: str
+    target_language: str
+    extra_context: str
+    started_at: float
+
+    first_token_at: Optional[float] = None
+    response_text: str = ""
+    error: Optional[str] = None
+    task: Optional[asyncio.Task] = None
+
+
+@dataclass
+class CheckoutDebounceState:
+    phase: CheckoutPhase
+    text: str
+    detected_language: Optional[str]
+    language_confidence: Optional[float]
+    stt_latency_ms: float
+    created_at: float
+
+
 class VoicePipeline:
     """
     Main voice pipeline orchestrator.
@@ -280,6 +319,7 @@ class VoicePipeline:
         self._lang_state = LangState(
             current="fr" if self.config.default_language.startswith("fr") else "en"
         )
+        self._turn_language: LanguageCode = self._lang_state.current
         
         # Components
         self._protocol = TwilioProtocolHandler()
@@ -303,10 +343,16 @@ class VoicePipeline:
         self._customer_address: str = ""
         self._customer_phone: str = ""
         self._customer_email: str = ""
+        self._checkout_debounce: Optional[CheckoutDebounceState] = None
+        self._checkout_debounce_task: Optional[asyncio.Task] = None
 
         # Track the last time we received any non-empty STT text (including interim results).
         # Used to avoid talking over the caller when Deepgram endpointing emits early finals.
         self._last_stt_text_time: float = 0.0
+        self._last_interim_transcript: str = ""
+
+        # Flux eager turn-taking: speculative LLM generation during pauses.
+        self._speculative_llm: Optional[SpeculativeLLMState] = None
         
         # TTS state
         self._pending_transcript: str = ""
@@ -360,8 +406,9 @@ class VoicePipeline:
         # Twilio client for hangup
         self._twilio_client: Optional[TwilioClient] = None
     
-    def _current_cartesia_voice_id(self) -> str:
-        if self._lang_state.current == "fr":
+    def _current_cartesia_voice_id(self, *, language: Optional[LanguageCode] = None) -> str:
+        lang = language or self._turn_language or self._lang_state.current
+        if lang == "fr":
             return self.config.cartesia_voice_id_fr or self.config.cartesia_voice_id
         return self.config.cartesia_voice_id
 
@@ -375,6 +422,80 @@ class VoicePipeline:
         parts = re.split(r"(?<=[.!?])\s+|\n+", cleaned)
         sentences = [p.strip() for p in parts if p and p.strip()]
         return sentences or [cleaned]
+
+    @staticmethod
+    def _looks_like_repair_text(text: str) -> bool:
+        t = _normalize_for_intent(text)
+        if not t:
+            return False
+        return any(
+            phrase in t
+            for phrase in (
+                "having trouble",
+                "technical issue",
+                "sorry",
+                "desole",
+                "souci technique",
+                "probleme technique",
+            )
+        )
+
+    def _infer_tone_mode(self, text: str, *, requested: Optional[ToneMode]) -> ToneMode:
+        if requested is not None:
+            return requested
+
+        if self._looks_like_repair_text(text):
+            return ToneMode.REPAIR
+
+        # Greeting is only for the first outbound utterance on call start.
+        normalized = _normalize_for_intent(text)
+        if self._current_turn == 0 and any(
+            normalized.startswith(prefix)
+            for prefix in ("hi", "hello", "allô", "allo", "bonjour", "bonsoir")
+        ):
+            return ToneMode.GREETING
+
+        if self._checkout_phase != CheckoutPhase.ORDERING:
+            return ToneMode.CHECKOUT_CAPTURE
+
+        return ToneMode.MENU_HELP
+
+    @staticmethod
+    def _apply_tone(text: str, *, language: LanguageCode, tone_mode: ToneMode) -> str:
+        t = (text or "").strip()
+        if not t:
+            return t
+
+        if tone_mode == ToneMode.GREETING:
+            return t
+
+        prefix_by_mode: dict[ToneMode, dict[LanguageCode, str]] = {
+            ToneMode.MENU_HELP: {"en": "Got it—", "fr": "D’accord—"},
+            ToneMode.CHECKOUT_CAPTURE: {"en": "Perfect—", "fr": "Parfait—"},
+            ToneMode.REPAIR: {"en": "No worries—", "fr": "Pas de souci—"},
+        }
+
+        prefix = prefix_by_mode.get(tone_mode, {}).get(language)
+        if not prefix:
+            return t
+
+        # Avoid double-prefixing when the message already begins with an acknowledgement.
+        normalized = _normalize_for_intent(t)
+        already_prefixed = any(
+            normalized.startswith(p)
+            for p in (
+                "got it",
+                "perfect",
+                "no worries",
+                "daccord",
+                "parfait",
+                "pas de souci",
+            )
+        )
+        if already_prefixed:
+            return t
+
+        return f"{prefix} {t}"
 
     @staticmethod
     def _is_barge_in_backchannel(text: str) -> bool:
@@ -688,20 +809,48 @@ class VoicePipeline:
         t = (text or "").strip()
         if not t:
             return ""
-        original = t
-        original = re.sub(
-            r"^(my address is|address is|it's|it is)\s+",
-            "",
-            original,
-            flags=re.IGNORECASE,
-        ).strip()
-        original = re.sub(
-            r"^(mon adresse est|l'adresse est|adresse|c'est)\s+",
-            "",
-            original,
-            flags=re.IGNORECASE,
-        ).strip()
-        return original if original else t
+
+        # Strip a few common "starter" fillers first.
+        t = re.sub(r"^(um+|uh+|erm+|euh+|hum+)\b[, ]*", "", t, flags=re.IGNORECASE).strip()
+        if not t:
+            return ""
+
+        normalized = _normalize_for_intent(t)
+        patterns = (
+            r"^(my address is|my address|address is|address|i live at|it's|it is)\b[,:\-\"]?\s*",
+            r"^(mon adresse est|mon adresse|l'adresse est|adresse|j'habite|c'?est)\b[,:\-\"]?\s*",
+        )
+
+        normalized_stripped = normalized
+        for pat in patterns:
+            normalized_stripped = re.sub(pat, "", normalized_stripped, flags=re.IGNORECASE).strip()
+
+        original = t.replace("ƒ?T", "'")
+        for pat in patterns:
+            original = re.sub(pat, "", original, flags=re.IGNORECASE).strip()
+
+        if not normalized_stripped:
+            return ""
+
+        prefix_only = {
+            "my address is",
+            "my address",
+            "address is",
+            "address",
+            "i live at",
+            "it's",
+            "it is",
+            "mon adresse est",
+            "mon adresse",
+            "l'adresse est",
+            "adresse",
+            "j'habite",
+            "c'est",
+        }
+        if normalized_stripped.strip(" .,!?:;-") in prefix_only:
+            return ""
+
+        return original if original else normalized_stripped
 
     def _extract_phone(self, text: str) -> str:
         t = (text or "").strip()
@@ -771,6 +920,13 @@ class VoicePipeline:
                 chars.append(ch.upper() if ch.isalpha() else ch)
         return ", ".join(chars)
 
+    def _spell_alnum_hyphen(self, value: str) -> str:
+        chars: List[str] = []
+        for ch in (value or "").strip():
+            if ch.isalnum():
+                chars.append(ch.upper() if ch.isalpha() else ch)
+        return "-".join(chars)
+
     def _spell_postal_code(self, address: str) -> Optional[str]:
         match = _CA_POSTAL_RE.search(address or "")
         if not match:
@@ -795,7 +951,7 @@ class VoicePipeline:
         if not self.config.menu_only:
             return False
 
-        language = self._lang_state.current
+        language = self._turn_language
 
         # Let callers jump back to ordering at any time.
         if self._checkout_phase != CheckoutPhase.ORDERING and self._wants_modify_order(transcript):
@@ -997,21 +1153,21 @@ class VoicePipeline:
             spelled_name = self._extract_spelled_name(transcript)
             if not spelled_name:
                 retry = (
-                    "D'accord. Épelez-le lettre par lettre, comme: J, O, H, N, espace, D, O, E."
+                    "D'accord. Épelez-le lettre par lettre, comme: J-O-H-N, espace, D-O-E."
                     if language == "fr"
-                    else "Okay. Spell it letter by letter, like: J, O, H, N, space, D, O, E."
+                    else "Okay. Spell it letter by letter, like: J-O-H-N, space, D-O-E."
                 )
                 await self._speak_response(retry)
                 return True
 
             self._customer_name = spelled_name
             parts = [p for p in re.split(r"\s+", spelled_name.strip()) if p]
-            spelled_parts = [self._spell_alnum(p) for p in parts]
+            spelled_parts = [self._spell_alnum_hyphen(p) for p in parts]
             separator = "ESPACE" if language == "fr" else "SPACE"
             spelled = (
-                f", {separator}, ".join(spelled_parts)
+                f" {separator} ".join(spelled_parts)
                 if spelled_parts
-                else self._spell_alnum(spelled_name)
+                else self._spell_alnum_hyphen(spelled_name)
             )
 
             confirm = (
@@ -1070,7 +1226,55 @@ class VoicePipeline:
             return True
 
         if self._checkout_phase == CheckoutPhase.ADDRESS_CONFIRM:
-            if self._is_affirmative(transcript):
+            treat_as_affirmative = self._is_affirmative(transcript)
+            treat_as_negative = self._is_negative(transcript)
+
+            # If the caller responds with a corrected address instead of "yes/no", accept it.
+            if not treat_as_affirmative and not treat_as_negative:
+                candidate = self._extract_address(transcript)
+                if candidate:
+                    if (
+                        self._customer_address
+                        and candidate.casefold() == self._customer_address.casefold()
+                    ):
+                        treat_as_affirmative = True
+                    else:
+                        self._customer_address = candidate
+
+                        spelled_number = self._spell_first_number(candidate)
+                        spelled_postal = self._spell_postal_code(candidate)
+
+                        parts: List[str] = []
+                        if spelled_number:
+                            parts.append(
+                                f"numéro {spelled_number}"
+                                if language == "fr"
+                                else f"number {spelled_number}"
+                            )
+                        if spelled_postal:
+                            parts.append(
+                                f"code postal {spelled_postal}"
+                                if language == "fr"
+                                else f"postal code {spelled_postal}"
+                            )
+                        spelled_bits = "; ".join(parts)
+
+                        if language == "fr":
+                            confirm = (
+                                f"Parfait. J'ai noté: {candidate}. Pour confirmer: {spelled_bits}. C'est exact ?"
+                                if spelled_bits
+                                else f"Parfait. J'ai noté: {candidate}. C'est exact ?"
+                            )
+                        else:
+                            confirm = (
+                                f"Great. I got: {candidate}. Just to confirm: {spelled_bits}. Is that correct?"
+                                if spelled_bits
+                                else f"Great. I got: {candidate}. Is that correct?"
+                            )
+                        await self._speak_response(confirm)
+                        return True
+
+            if treat_as_affirmative:
                 if self._customer_phone:
                     digits_spelled = self._spell_phone_digits(self._customer_phone)
                     confirm = (
@@ -1091,7 +1295,7 @@ class VoicePipeline:
                 await self._speak_response(ask)
                 return True
 
-            if self._is_negative(transcript):
+            if treat_as_negative:
                 self._checkout_phase = CheckoutPhase.ADDRESS
                 ask = (
                     "Oups, d’accord. Pouvez-vous répéter l’adresse lentement ?"
@@ -1102,9 +1306,9 @@ class VoicePipeline:
                 return True
 
             reprompt = (
-                "Juste pour confirmer: est-ce que l’adresse est correcte ? Oui ou non ?"
+                "Juste pour confirmer: est-ce que l’adresse est correcte ? (Vous pouvez dire oui, ou me donner la bonne adresse.)"
                 if language == "fr"
-                else "Quick check—is that address correct? Yes or no?"
+                else "Just to confirm: is that address correct? (You can say yes, or tell me the correct address.)"
             )
             await self._speak_response(reprompt)
             return True
@@ -1273,6 +1477,7 @@ class VoicePipeline:
         previous = self._lang_state.current
         now = time.time()
         self._lang_state.force(target, now)
+        self._turn_language = target
         
         confirmation = (
             "D’accord, je continue en français."
@@ -1290,7 +1495,7 @@ class VoicePipeline:
             previous_language=previous,
         )
 
-        await self._speak_response(confirmation)
+        await self._speak_response(confirmation, tone_mode=ToneMode.GREETING, language=target)
     
     @property
     def state(self) -> PipelineState:
@@ -1330,6 +1535,8 @@ class VoicePipeline:
         # Set up STT callback
         self._stt.set_transcript_callback(self._on_transcript)
         self._stt.set_speech_started_callback(self._on_speech_started)
+        self._stt.set_eager_end_of_turn_callback(self._on_eager_end_of_turn)
+        self._stt.set_turn_resumed_callback(self._on_turn_resumed)
         
         # Initialize Twilio client for hangup
         if self.config.twilio_account_sid and self.config.twilio_auth_token:
@@ -1368,6 +1575,8 @@ class VoicePipeline:
                 tasks_to_cancel.append(task)
         
         await self._stop_pacer()
+        self._cancel_speculative_llm(reason="stop")
+        self._cancel_checkout_debounce(reason="stop")
         
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
@@ -1528,6 +1737,321 @@ class VoicePipeline:
             self._begin_soft_interrupt(reason="vad")
             logger.debug("Speech started detected during TTS")
 
+    async def _on_eager_end_of_turn(self, transcript: str) -> None:
+        """
+        Handle Flux EagerEndOfTurn.
+
+        We start speculative (ephemeral) LLM generation during a pause, and cancel if
+        Flux reports TurnResumed (caller keeps talking).
+        """
+        if not self._is_running:
+            return
+
+        # Only speculate while we're listening; if we're already speaking/processing,
+        # this doesn't help and may create needless cost.
+        if self._state != PipelineState.LISTENING:
+            return
+
+        candidate = (transcript or "").strip() or (self._last_interim_transcript or "").strip()
+        if not candidate:
+            return
+
+        # Don't speculate in deterministic checkout capture states.
+        if self.config.menu_only and self._checkout_phase != CheckoutPhase.ORDERING:
+            return
+
+        # Avoid speculative calls for tiny backchannels / filler.
+        if len(candidate) < 8:
+            return
+        if self._is_barge_in_backchannel(candidate) and len(candidate.split()) <= 2:
+            return
+
+        self._start_speculative_llm(candidate, reason="flux_eager_eot")
+
+    async def _on_turn_resumed(self) -> None:
+        """Handle Flux TurnResumed (cancel speculative work)."""
+        if not self._is_running:
+            return
+        self._cancel_speculative_llm(reason="flux_turn_resumed")
+
+    def _start_speculative_llm(self, transcript: str, *, reason: str) -> None:
+        if not self._llm:
+            return
+
+        text = (transcript or "").strip()
+        if not text:
+            return
+
+        target_language = self._lang_state.current
+        inferred_language, inferred_confidence = infer_language_from_text(text)
+        if (
+            inferred_language is not None
+            and inferred_confidence is not None
+            and inferred_confidence >= 0.7
+        ):
+            target_language = inferred_language
+        normalized = _normalize_for_intent(text)
+        extra_context = self._build_extra_context(text, language=target_language)
+
+        existing = self._speculative_llm
+        if (
+            existing
+            and existing.transcript_norm == normalized
+            and existing.target_language == target_language
+            and existing.extra_context == extra_context
+        ):
+            return
+
+        self._cancel_speculative_llm(reason="replaced")
+
+        state = SpeculativeLLMState(
+            transcript=text,
+            transcript_norm=normalized,
+            target_language=target_language,
+            extra_context=extra_context,
+            started_at=time.time(),
+        )
+        state.task = asyncio.create_task(self._run_speculative_llm(state))
+        self._speculative_llm = state
+
+        logger.debug(
+            "Speculative LLM started",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+            language=target_language,
+            transcript=_redact_transcript_for_logs(text)[:80],
+        )
+
+    def _cancel_speculative_llm(self, *, reason: str) -> None:
+        state = self._speculative_llm
+        if not state:
+            return
+
+        if state.task and not state.task.done():
+            state.task.cancel()
+
+        self._speculative_llm = None
+        logger.debug(
+            "Speculative LLM cancelled",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+        )
+
+    async def _run_speculative_llm(self, state: SpeculativeLLMState) -> None:
+        if not self._llm:
+            return
+
+        try:
+            async for chunk in self._llm.generate_streaming_ephemeral(
+                state.transcript,
+                target_language=state.target_language,
+                extra_context=state.extra_context,
+            ):
+                if state.first_token_at is None:
+                    state.first_token_at = time.time()
+                state.response_text += chunk
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            state.error = str(e)
+        finally:
+            # Nothing to do; the consumer will decide whether to use it.
+            pass
+
+    def _cancel_checkout_debounce(self, *, reason: str) -> None:
+        if self._checkout_debounce_task and not self._checkout_debounce_task.done():
+            self._checkout_debounce_task.cancel()
+        self._checkout_debounce_task = None
+        self._checkout_debounce = None
+        logger.debug(
+            "Checkout debounce cleared",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _meaningful_token_count(text: str) -> int:
+        normalized = _normalize_for_intent(text)
+        tokens = re.findall(r"[a-z0-9]+", normalized)
+        return len([t for t in tokens if t])
+
+    def _should_debounce_checkout_final(self, text: str) -> bool:
+        if not self.config.menu_only:
+            return False
+
+        phase = self._checkout_phase
+        normalized = _normalize_for_intent(text).strip(" .,!?:;-")
+
+        if phase == CheckoutPhase.NAME:
+            extracted = self._extract_name(text)
+            if extracted:
+                # If the name fragment is very short (e.g., "Hatem"), wait briefly for a
+                # possible continuation ("Hatem Ben"). If nothing follows, we'll flush.
+                return self._meaningful_token_count(extracted) < 2
+            # Prefix-only finals like "my name is" often arrive right before the actual name.
+            return bool(
+                re.match(
+                    r"^(my name is|my name'?s|my name|this is|it'?s|it is|je m'appelle|j'm'appelle|mon nom est|c'?est)$",
+                    normalized,
+                    flags=re.IGNORECASE,
+                )
+            )
+
+        if phase == CheckoutPhase.ADDRESS:
+            extracted = self._extract_address(text)
+            if not extracted:
+                return bool(
+                    re.match(
+                        r"^(my address is|my address|address is|address|mon adresse est|mon adresse|l'adresse est|adresse|c'?est)$",
+                        normalized,
+                        flags=re.IGNORECASE,
+                    )
+                )
+            # If the address fragment is too short (e.g., "405"), wait briefly for the next final.
+            return self._meaningful_token_count(extracted) < 2
+
+        return False
+
+    async def _enqueue_turn_transcript(
+        self,
+        *,
+        text: str,
+        stt_latency_ms: float,
+        detected_language: Optional[str],
+        language_confidence: Optional[float],
+        source: str,
+    ) -> None:
+        logger.info(
+            "Final transcript",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            menu_only=self.config.menu_only,
+            checkout_phase=str(self._checkout_phase),
+            source=source,
+            text=_redact_transcript_for_logs(text)[:100],
+        )
+        await self._turn_queue.put(
+            QueuedTranscript(
+                text=text,
+                stt_latency_ms=stt_latency_ms,
+                detected_language=detected_language,
+                language_confidence=language_confidence,
+            )
+        )
+
+    async def _flush_checkout_debounce_after(self, *, created_at: float, delay_s: float) -> None:
+        try:
+            await asyncio.sleep(delay_s)
+            if not self._is_running:
+                return
+
+            pending = self._checkout_debounce
+            if not pending or pending.created_at != created_at:
+                return
+
+            # If we're no longer in the same capture phase, don't hold the transcript.
+            if pending.phase != self._checkout_phase:
+                return
+
+            await self._enqueue_turn_transcript(
+                text=pending.text,
+                stt_latency_ms=pending.stt_latency_ms,
+                detected_language=pending.detected_language,
+                language_confidence=pending.language_confidence,
+                source="checkout_debounce_flush",
+            )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Clear regardless; worst case we ask again.
+            if self._checkout_debounce and self._checkout_debounce.created_at == created_at:
+                self._checkout_debounce = None
+            self._checkout_debounce_task = None
+
+    async def _maybe_debounce_checkout_final(
+        self,
+        *,
+        text: str,
+        stt_latency_ms: float,
+        detected_language: Optional[str],
+        language_confidence: Optional[float],
+    ) -> bool:
+        """
+        Debounce short/prefix-only finals in NAME/ADDRESS capture.
+
+        Deepgram can finalize a prefix ("my name is") right before the actual value.
+        Waiting ~250–400ms and concatenating produces a single, correct utterance.
+        """
+        if not self.config.menu_only:
+            return False
+
+        now = time.time()
+        pending = self._checkout_debounce
+
+        # If we already have a pending fragment, try to combine with this one.
+        if pending:
+            same_phase = pending.phase == self._checkout_phase
+            within_window = (now - pending.created_at) <= 0.45
+
+            if same_phase and within_window and self._checkout_phase in (
+                CheckoutPhase.NAME,
+                CheckoutPhase.ADDRESS,
+            ):
+                combined = (pending.text + " " + text).strip()
+                self._cancel_checkout_debounce(reason="combined")
+                await self._enqueue_turn_transcript(
+                    text=combined,
+                    stt_latency_ms=stt_latency_ms,
+                    detected_language=detected_language,
+                    language_confidence=language_confidence,
+                    source="checkout_debounce_combined",
+                )
+                return True
+
+            # Stale or phase changed: flush the pending fragment immediately.
+            self._cancel_checkout_debounce(reason="stale")
+            await self._enqueue_turn_transcript(
+                text=pending.text,
+                stt_latency_ms=pending.stt_latency_ms,
+                detected_language=pending.detected_language,
+                language_confidence=pending.language_confidence,
+                source="checkout_debounce_stale_flush",
+            )
+
+        if self._checkout_phase not in (CheckoutPhase.NAME, CheckoutPhase.ADDRESS):
+            return False
+
+        if not self._should_debounce_checkout_final(text):
+            return False
+
+        delay_s = 0.35  # 250–400ms window
+        self._checkout_debounce = CheckoutDebounceState(
+            phase=self._checkout_phase,
+            text=text,
+            detected_language=detected_language,
+            language_confidence=language_confidence,
+            stt_latency_ms=stt_latency_ms,
+            created_at=now,
+        )
+        if self._checkout_debounce_task and not self._checkout_debounce_task.done():
+            self._checkout_debounce_task.cancel()
+        self._checkout_debounce_task = asyncio.create_task(
+            self._flush_checkout_debounce_after(created_at=now, delay_s=delay_s)
+        )
+
+        logger.debug(
+            "Checkout debounce started",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            checkout_phase=str(self._checkout_phase),
+            delay_ms=int(delay_s * 1000),
+            text=_redact_transcript_for_logs(text)[:80],
+        )
+        return True
+
     async def _on_transcript(self, result: TranscriptionResult) -> None:
         """
         Handle STT transcript.
@@ -1540,6 +2064,8 @@ class VoicePipeline:
         if result.text and result.text.strip():
             self._last_stt_text_time = time.time()
             self._last_speech_activity_time = time.time()
+            # Track latest interim text for Flux EagerEndOfTurn speculation.
+            self._last_interim_transcript = result.text.strip()
 
         if not self._logged_first_transcript and result.text:
             self._logged_first_transcript = True
@@ -1615,23 +2141,21 @@ class VoicePipeline:
             if self._pending_transcript:
                 transcript = self._pending_transcript
                 self._pending_transcript = ""
-            
-            logger.info(
-                "Final transcript",
-                call_sid=self.call_sid,
-                stream_sid=self.stream_sid,
-                menu_only=self.config.menu_only,
-                checkout_phase=str(self._checkout_phase),
-                text=_redact_transcript_for_logs(transcript)[:100],
-                speech_final=result.speech_final,
-            )
-            await self._turn_queue.put(
-                QueuedTranscript(
-                    text=transcript,
-                    stt_latency_ms=result.latency_ms,
-                    detected_language=result.detected_language,
-                    language_confidence=result.language_confidence,
-                )
+
+            if await self._maybe_debounce_checkout_final(
+                text=transcript,
+                stt_latency_ms=result.latency_ms,
+                detected_language=result.detected_language,
+                language_confidence=result.language_confidence,
+            ):
+                return
+
+            await self._enqueue_turn_transcript(
+                text=transcript,
+                stt_latency_ms=result.latency_ms,
+                detected_language=result.detected_language,
+                language_confidence=result.language_confidence,
+                source="stt_final",
             )
     
     async def _handle_hard_interrupt(self, *, reason: str) -> None:
@@ -1662,6 +2186,8 @@ class VoicePipeline:
         self._call_metrics.total_interruptions += 1
         self._speech_started_during_tts = False
         self._clear_soft_interrupt(reason="hard")
+        self._cancel_speculative_llm(reason="hard_interrupt")
+        self._cancel_checkout_debounce(reason="hard_interrupt")
         
         if self._current_turn_metrics:
             self._current_turn_metrics.was_interrupted = True
@@ -1760,6 +2286,42 @@ class VoicePipeline:
                 effective_language_confidence = inferred_confidence
                 detection_source = "text"
 
+        # Reply language: follow the detected language of the *last user utterance* when it
+        # is confident/meaningful, without announcing. Keep stabilization for `current`.
+        reply_language: LanguageCode = self._lang_state.current
+        normalized_detected = normalize_detected_language(effective_detected_language)
+        try:
+            confidence_value = (
+                float(effective_language_confidence)
+                if effective_language_confidence is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            confidence_value = None
+
+        normalized_text = _normalize_for_intent(transcript).strip(" .,!?:;-")
+        greeting_tokens = {
+            "bonjour",
+            "salut",
+            "allo",
+            "bonsoir",
+            "hello",
+            "hi",
+            "hey",
+        }
+        is_short_greeting = normalized_text in greeting_tokens
+
+        if (
+            normalized_detected
+            and confidence_value is not None
+            and confidence_value >= self._lang_state.CONFIDENCE_SWITCH
+            and not self._is_barge_in_backchannel(transcript)
+        ):
+            if len(transcript.strip()) >= self._lang_state.MIN_CHARS or is_short_greeting:
+                reply_language = normalized_detected
+
+        self._turn_language = reply_language
+
         switched, reason = self._lang_state.update_from_detection(
             text=transcript,
             detected_language=effective_detected_language,
@@ -1772,6 +2334,7 @@ class VoicePipeline:
             detected_language=effective_detected_language,
             language_confidence=effective_language_confidence,
             current_language=self._lang_state.current,
+            reply_language=reply_language,
             switched=switched,
             reason=reason or None,
             previous_language=previous_language,
@@ -1794,7 +2357,7 @@ class VoicePipeline:
         # Try semantic routing first
         if (
             not self.config.menu_only
-            and self._lang_state.current == "en"
+            and self._turn_language == "en"
             and self._router
             and self._router.is_enabled
         ):
@@ -1830,37 +2393,98 @@ class VoicePipeline:
         if not self._llm:
             logger.error("LLM not initialized")
             return
-        
+
         llm_start = time.time()
-        first_token_time = None
+        first_token_time: Optional[float] = None
         full_response = ""
-        
-        extra_context = self._build_extra_context(transcript)
+
+        extra_context = self._build_extra_context(transcript, language=self._turn_language)
+        transcript_norm = _normalize_for_intent(transcript)
+
+        speculative = self._speculative_llm
+        speculative_match = bool(
+            speculative
+            and not speculative.error
+            and speculative.transcript_norm == transcript_norm
+            and speculative.target_language == self._turn_language
+            and speculative.extra_context == extra_context
+        )
+
+        # If a speculative task exists but doesn't match this turn, cancel it to avoid
+        # spending tokens on stale/incorrect partials.
+        if speculative and not speculative_match:
+            self._cancel_speculative_llm(reason="final_mismatch")
+            speculative = None
 
         # Collect LLM response (keep processing state until we actually speak)
         try:
             self._state = PipelineState.PROCESSING
-            
-            async for chunk in self._llm.generate_streaming(
-                transcript,
-                target_language=self._lang_state.current,
-                extra_context=extra_context,
-            ):
-                if not self._is_running or self._state == PipelineState.INTERRUPTED:
-                    break
-                
-                if first_token_time is None:
-                    first_token_time = time.time()
-                    if self._current_turn_metrics:
-                        self._current_turn_metrics.llm_first_token_ms = (
-                            first_token_time - llm_start
-                        ) * 1000
-                
-                full_response += chunk
+
+            used_speculative = False
+            if speculative_match and speculative and speculative.task:
+                logger.debug(
+                    "Using speculative LLM",
+                    call_sid=self.call_sid,
+                    stream_sid=self.stream_sid,
+                )
+
+                # Wait for the speculative generation to finish (or be cancelled).
+                await speculative.task
+
+                if speculative.error or not (speculative.response_text or "").strip():
+                    logger.debug(
+                        "Speculative LLM unusable, falling back",
+                        call_sid=self.call_sid,
+                        stream_sid=self.stream_sid,
+                        error=speculative.error,
+                    )
+                    self._speculative_llm = None
+                else:
+                    used_speculative = True
+                    llm_start = speculative.started_at
+                    first_token_time = speculative.first_token_at
+                    full_response = speculative.response_text
+
+                    # Consume speculative state to prevent re-use.
+                    self._speculative_llm = None
+
+                    # Commit history only when we actually use the output.
+                    if full_response and self._state != PipelineState.INTERRUPTED:
+                        self._llm.commit_turn(
+                            user_message=transcript,
+                            assistant_message=full_response,
+                        )
+
+            if not used_speculative:
+                # Normal (non-speculative) generation path.
+                llm_start = time.time()
+                first_token_time = None
+                full_response = ""
+
+                async for chunk in self._llm.generate_streaming(
+                    transcript,
+                    target_language=self._turn_language,
+                    extra_context=extra_context,
+                ):
+                    if not self._is_running or self._state == PipelineState.INTERRUPTED:
+                        break
+
+                    if first_token_time is None:
+                        first_token_time = time.time()
+                        if self._current_turn_metrics:
+                            self._current_turn_metrics.llm_first_token_ms = (
+                                first_token_time - llm_start
+                            ) * 1000
+
+                    full_response += chunk
             
             # Record LLM metrics
             llm_end = time.time()
             if self._current_turn_metrics:
+                if first_token_time is not None:
+                    self._current_turn_metrics.llm_first_token_ms = (
+                        first_token_time - llm_start
+                    ) * 1000
                 self._current_turn_metrics.llm_total_ms = (llm_end - llm_start) * 1000
             
             # Speak the response if not interrupted
@@ -1885,7 +2509,12 @@ class VoicePipeline:
                 self._state = PipelineState.LISTENING
             self._speech_started_during_tts = False
 
-    def _build_extra_context(self, transcript: str) -> Optional[str]:
+    def _build_extra_context(
+        self,
+        transcript: str,
+        *,
+        language: Optional[LanguageCode] = None,
+    ) -> Optional[str]:
         """
         Build optional extra system context for the LLM.
 
@@ -1896,7 +2525,7 @@ class VoicePipeline:
         if not catalog:
             return None
 
-        language = self._lang_state.current
+        language = language or self._turn_language
         wants_menu = looks_like_menu_request(transcript, language=language)
         wants_full_menu = looks_like_full_menu_request(transcript, language=language)
         section_hits = find_menu_sections(catalog, transcript, limit=2)
@@ -2215,7 +2844,13 @@ class VoicePipeline:
         if depth > self._queue_depth_max:
             self._queue_depth_max = depth
     
-    async def _speak_response(self, text: str) -> None:
+    async def _speak_response(
+        self,
+        text: str,
+        *,
+        tone_mode: Optional[ToneMode] = None,
+        language: Optional[LanguageCode] = None,
+    ) -> None:
         """
         Synthesize and stream TTS response to Twilio via audio pacer.
         
@@ -2224,8 +2859,13 @@ class VoicePipeline:
         if not text or not self._is_running:
             return
 
+        lang = language or self._turn_language or self._lang_state.current
+        mode = self._infer_tone_mode(text, requested=tone_mode)
+        text = self._apply_tone(text, language=lang, tone_mode=mode)
+
         # Avoid talking over the caller when STT is still producing interim text.
-        await self._wait_for_stt_quiet()
+        min_quiet_ms = 350 if mode in (ToneMode.CHECKOUT_CAPTURE, ToneMode.REPAIR) else 250
+        await self._wait_for_stt_quiet(min_quiet_ms=min_quiet_ms)
         
         tts_start = time.time()
         first_audio_time = None
@@ -2241,7 +2881,7 @@ class VoicePipeline:
             # otherwise we insert silence between streamed chunks which sounds like "ticking".
             self._outbound_ulaw_remainder = b""
 
-            voice_id = self._current_cartesia_voice_id()
+            voice_id = self._current_cartesia_voice_id(language=lang)
 
             # Best practice: Insert marks at sentence boundaries to track real playback and
             # make interruptions feel clean.
@@ -2377,12 +3017,13 @@ class VoicePipeline:
                 ):
                     # Extended silence - prompt user
                     logger.debug("Extended silence detected")
+                    lang = self._turn_language or self._lang_state.current
                     prompt = (
                         "Vous êtes toujours là ? Est-ce que je peux vous aider avec autre chose ?"
-                        if self._lang_state.current == "fr"
+                        if lang == "fr"
                         else "Are you still there? Is there anything else I can help you with?"
                     )
-                    await self._speak_response(prompt)
+                    await self._speak_response(prompt, tone_mode=ToneMode.REPAIR, language=lang)
                     self._last_silence_prompt_time = now
                      
         except asyncio.CancelledError:

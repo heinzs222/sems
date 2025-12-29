@@ -46,9 +46,9 @@ class Config:
     
     # Deepgram (STT)
     deepgram_api_key: str = ""
-    deepgram_eager_eot_threshold: float = 0.38
-    deepgram_eot_threshold: float = 0.74
-    deepgram_eot_timeout_ms: int = 6500
+    deepgram_eager_eot_threshold: float = 0.45
+    deepgram_eot_threshold: float = 0.72
+    deepgram_eot_timeout_ms: int = 4500
     
     # Cartesia (TTS)
     cartesia_api_key: str = ""
@@ -77,7 +77,7 @@ class Config:
     company_name: str = "Sesame AI"
     max_history_turns: int = 10
     silence_timeout_seconds: float = 1.5
-    min_interruption_words: int = 3
+    min_interruption_words: int = 2
 
     # Audio pacing / jitter buffer (Twilio PSTN is jittery; this smooths outbound playback)
     # - jitter_buffer_ms: initial target prebuffer before starting an audio burst
@@ -218,9 +218,9 @@ def get_config() -> Config:
         
         # Deepgram
         deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
-        deepgram_eager_eot_threshold=_get_float("DEEPGRAM_EAGER_EOT_THRESHOLD", 0.38),
-        deepgram_eot_threshold=_get_float("DEEPGRAM_EOT_THRESHOLD", 0.74),
-        deepgram_eot_timeout_ms=_get_int("DEEPGRAM_EOT_TIMEOUT_MS", 6500),
+        deepgram_eager_eot_threshold=_get_float("DEEPGRAM_EAGER_EOT_THRESHOLD", 0.45),
+        deepgram_eot_threshold=_get_float("DEEPGRAM_EOT_THRESHOLD", 0.72),
+        deepgram_eot_timeout_ms=_get_int("DEEPGRAM_EOT_TIMEOUT_MS", 4500),
         
         # Cartesia
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
@@ -247,7 +247,7 @@ def get_config() -> Config:
         company_name=os.getenv("COMPANY_NAME", "Sesame AI"),
         max_history_turns=_get_int("MAX_HISTORY_TURNS", 10),
         silence_timeout_seconds=_get_float("SILENCE_TIMEOUT_SECONDS", 1.5),
-        min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 3),
+        min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 2),
 
         # Audio pacing / jitter buffer
         jitter_buffer_ms=_get_int("JITTER_BUFFER_MS", 160),

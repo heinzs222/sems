@@ -318,7 +318,7 @@ This converts WAV files to raw mu-law 8kHz format for Twilio.
 **Symptoms**: Agent doesn't stop when you interrupt.
 
 **Solutions**:
-1. Speak at least 3 words clearly (barge-in threshold)
+1. Speak at least 2 words clearly (barge-in threshold)
 2. Check `MIN_INTERRUPTION_WORDS` setting
 3. Verify STT is receiving audio (check transcription logs)
 4. Ensure `allow_interruptions` is enabled in pipeline
