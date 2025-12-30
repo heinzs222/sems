@@ -94,6 +94,7 @@ class ToneMode(str, Enum):
     MENU_HELP = "menu_help"
     CHECKOUT_CAPTURE = "checkout_capture"
     REPAIR = "repair"
+    CHECK_IN = "check_in"
 
 
 def _normalize_for_intent(text: str) -> str:
@@ -406,6 +407,8 @@ class VoicePipeline:
         self._last_audio_frame_time: float = 0.0
         self._last_speech_activity_time: float = 0.0
         self._last_silence_prompt_time: float = 0.0
+        self._silence_checkin_count: int = 0
+        self._last_agent_audio_time: float = 0.0
         self._silence_task: Optional[asyncio.Task] = None
 
         # Debug flags (kept minimal to avoid noisy logs)
@@ -475,13 +478,13 @@ class VoicePipeline:
         if not t:
             return t
 
-        if tone_mode == ToneMode.GREETING:
+        if tone_mode in (ToneMode.GREETING, ToneMode.CHECK_IN):
             return t
 
         prefix_by_mode: dict[ToneMode, dict[LanguageCode, str]] = {
-            ToneMode.MENU_HELP: {"en": "Got it—", "fr": "D’accord—"},
-            ToneMode.CHECKOUT_CAPTURE: {"en": "Perfect—", "fr": "Parfait—"},
-            ToneMode.REPAIR: {"en": "No worries—", "fr": "Pas de souci—"},
+            ToneMode.MENU_HELP: {"en": "Got it,", "fr": "D'accord,"},
+            ToneMode.CHECKOUT_CAPTURE: {"en": "Okay,", "fr": "Parfait,"},
+            ToneMode.REPAIR: {"en": "No rush,", "fr": "Pas de presse,"},
         }
 
         prefix = prefix_by_mode.get(tone_mode, {}).get(language)
@@ -494,11 +497,14 @@ class VoicePipeline:
             normalized.startswith(p)
             for p in (
                 "got it",
+                "okay",
                 "perfect",
-                "no worries",
+                "no rush",
                 "daccord",
+                "d'accord",
                 "parfait",
                 "pas de souci",
+                "pas de presse",
             )
         )
         if already_prefixed:
@@ -1054,9 +1060,9 @@ class VoicePipeline:
             name = self._extract_name(transcript)
             if not name:
                 retry = (
-                    "Pas de souci — quel nom dois-je utiliser pour la commande ? (Votre prénom suffit.)"
+                    "Pas de presse. Quel nom dois-je utiliser pour la commande ? (Votre prénom suffit.)"
                     if language == "fr"
-                    else "No worries—I didn’t catch that. What name should I use for the order? (First name is totally fine.)"
+                    else "No rush. I didn’t catch that. What name should I use for the order? (First name is totally fine.)"
                 )
                 await self._speak_response(retry)
                 return True
@@ -1669,6 +1675,8 @@ class VoicePipeline:
         self._last_audio_frame_time = now
         self._last_speech_activity_time = now
         self._last_silence_prompt_time = 0.0
+        self._silence_checkin_count = 0
+        self._last_agent_audio_time = now
 
         # Reset per-call contextual buffers.
         self._inbound_ulaw_history.clear()
@@ -1753,6 +1761,8 @@ class VoicePipeline:
             return
 
         self._last_speech_activity_time = time.time()
+        self._silence_checkin_count = 0
+        self._last_silence_prompt_time = 0.0
         
         if self._state == PipelineState.SPEAKING:
             self._speech_started_during_tts = True
@@ -2096,6 +2106,8 @@ class VoicePipeline:
         if result.text and result.text.strip():
             self._last_stt_text_time = time.time()
             self._last_speech_activity_time = time.time()
+            self._silence_checkin_count = 0
+            self._last_silence_prompt_time = 0.0
             # Track latest interim text for Flux EagerEndOfTurn speculation.
             self._last_interim_transcript = result.text.strip()
 
@@ -2920,6 +2932,8 @@ class VoicePipeline:
         lang = language or self._turn_language or self._lang_state.current
         mode = self._infer_tone_mode(text, requested=tone_mode)
         text = self._apply_tone(text, language=lang, tone_mode=mode)
+        # Collapse whitespace/newlines to avoid unnatural long pauses in TTS.
+        text = re.sub(r"\s+", " ", text).strip()
 
         # Avoid talking over the caller when STT is still producing interim text.
         min_quiet_ms = 350 if mode in (ToneMode.CHECKOUT_CAPTURE, ToneMode.REPAIR) else 250
@@ -2929,6 +2943,12 @@ class VoicePipeline:
         first_audio_time = None
         
         self._state = PipelineState.SPEAKING
+
+        # A normal assistant reply resets the silence check-in schedule (caller gets a fresh window).
+        # Do not reset on CHECK_IN prompts, otherwise we'd loop indefinitely.
+        if mode != ToneMode.CHECK_IN:
+            self._silence_checkin_count = 0
+            self._last_silence_prompt_time = 0.0
         
         # Start pacer if not running
         await self._start_pacer()
@@ -2961,12 +2981,10 @@ class VoicePipeline:
 
             voice_id = self._current_cartesia_voice_id(language=lang)
 
-            # For CSM, synthesize the full utterance in one request to preserve prosody and
-            # reduce network roundtrips; keep sentence marks for fast streaming providers.
-            segments = [text] if tts_provider == "csm" else self._split_sentences(text)
+            # Synthesize the full utterance in one go to avoid audible gaps between segments.
+            segments = [text]
 
-            # Best practice: Insert marks at sentence boundaries to track real playback and
-            # make interruptions feel clean.
+            # Insert a mark after the utterance so we can observe playback RTT (best-effort).
             for segment in segments:
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
                     break
@@ -3005,6 +3023,7 @@ class VoicePipeline:
                                 if len(assistant_ulaw_tail) > tail_max_bytes:
                                     del assistant_ulaw_tail[:-tail_max_bytes]
                             msg = create_media_message(self._protocol.stream_sid, frame)
+                            self._last_agent_audio_time = time.time()
                             await self._enqueue_outbound(msg, pace=True)
 
                     if (
@@ -3019,6 +3038,7 @@ class VoicePipeline:
                             if len(assistant_ulaw_tail) > tail_max_bytes:
                                 del assistant_ulaw_tail[:-tail_max_bytes]
                         msg = create_media_message(self._protocol.stream_sid, frame)
+                        self._last_agent_audio_time = time.time()
                         await self._enqueue_outbound(msg, pace=True)
 
                 # If we soft-paused mid-sentence (backchannel/noise), wait briefly for resume so we
@@ -3038,6 +3058,7 @@ class VoicePipeline:
                             if len(assistant_ulaw_tail) > tail_max_bytes:
                                 del assistant_ulaw_tail[:-tail_max_bytes]
                         msg = create_media_message(self._protocol.stream_sid, frame)
+                        self._last_agent_audio_time = time.time()
                         await self._enqueue_outbound(msg, pace=True)
 
                     if self._outbound_ulaw_remainder:
@@ -3048,6 +3069,7 @@ class VoicePipeline:
                             if len(assistant_ulaw_tail) > tail_max_bytes:
                                 del assistant_ulaw_tail[:-tail_max_bytes]
                         msg = create_media_message(self._protocol.stream_sid, frame)
+                        self._last_agent_audio_time = time.time()
                         await self._enqueue_outbound(msg, pace=True)
 
                 mark_msg = self._protocol.create_mark()
@@ -3096,6 +3118,8 @@ class VoicePipeline:
             audio_chunks: List of 160-byte mu-law chunks
         """
         self._state = PipelineState.SPEAKING
+        self._silence_checkin_count = 0
+        self._last_silence_prompt_time = 0.0
         
         try:
             for chunk in audio_chunks:
@@ -3103,6 +3127,7 @@ class VoicePipeline:
                     break
                 
                 msg = create_media_message(self._protocol.stream_sid, chunk)
+                self._last_agent_audio_time = time.time()
                 await self._send_message(msg)
                 # 20ms per chunk
                 await asyncio.sleep(0.015)  # Slightly less than 20ms to allow for processing
@@ -3132,27 +3157,96 @@ class VoicePipeline:
                 if self._state != PipelineState.LISTENING:
                     continue
                 
-                # Speech-aware silence: use VAD/transcript activity, not raw Twilio frames (which
-                # often continue even during silence).
+                # Silence check-ins should feel calm and human:
+                # - Never fire immediately after the agent spoke.
+                # - Never spam; use a slow backoff and stop after a small number of prompts.
                 now = time.time()
-                base = self._last_speech_activity_time or self._last_audio_frame_time or now
+
+                if self._output_task and not self._output_task.done():
+                    continue
+
+                max_prompts = max(
+                    0, int(getattr(self.config, "silence_checkin_max_prompts", 2) or 0)
+                )
+                if max_prompts <= 0:
+                    continue
+                if self._silence_checkin_count >= max_prompts:
+                    continue
+
+                # Count silence from the most recent of:
+                # - user activity (VAD/transcript)
+                # - agent audio output (prevents immediate "still there?" after we spoke)
+                base = max(self._last_speech_activity_time or 0.0, self._last_agent_audio_time or 0.0)
+                if base <= 0.0:
+                    base = now
                 silence_duration = now - base
+
+                delay_s = (
+                    float(getattr(self.config, "silence_checkin_first_s", 12.0) or 12.0)
+                    if self._silence_checkin_count == 0
+                    else float(getattr(self.config, "silence_checkin_next_s", 25.0) or 25.0)
+                )
+                delay_s = max(4.0, delay_s)
                 since_last_prompt = now - (self._last_silence_prompt_time or 0.0)
-                
-                if (
-                    silence_duration > self.config.silence_timeout_seconds * 3
-                    and since_last_prompt > self.config.silence_timeout_seconds * 3
-                ):
-                    # Extended silence - prompt user
-                    logger.debug("Extended silence detected")
-                    lang = self._turn_language or self._lang_state.current
+
+                if silence_duration < delay_s or since_last_prompt < delay_s:
+                    continue
+
+                lang = self._turn_language or self._lang_state.current
+
+                # Attempt 0: gentle presence. Attempt 1+: re-ask the current step.
+                if self._silence_checkin_count == 0:
                     prompt = (
-                        "Vous êtes toujours là ? Est-ce que je peux vous aider avec autre chose ?"
+                        "Pas de presse, je suis là. Quand vous êtes prêt, dites-moi simplement ce que vous voulez."
                         if lang == "fr"
-                        else "Are you still there? Is there anything else I can help you with?"
+                        else "No rush, I'm here. When you're ready, just tell me what you'd like."
                     )
-                    await self._speak_response(prompt, tone_mode=ToneMode.REPAIR, language=lang)
-                    self._last_silence_prompt_time = now
+                else:
+                    phase = self._checkout_phase if self.config.menu_only else CheckoutPhase.ORDERING
+                    if lang == "fr":
+                        prompt_by_phase = {
+                            CheckoutPhase.ORDERING: "Quand vous êtes prêt, qu'est-ce que je vous ajoute du menu ?",
+                            CheckoutPhase.NAME: "Quand vous êtes prêt, quel nom dois-je mettre pour la commande ?",
+                            CheckoutPhase.NAME_CONFIRM: "Quand vous êtes prêt, est-ce que le nom est correct ?",
+                            CheckoutPhase.ADDRESS: "Quand vous êtes prêt, quelle est l'adresse de livraison ?",
+                            CheckoutPhase.ADDRESS_CONFIRM: "Quand vous êtes prêt, est-ce que l'adresse est correcte ?",
+                            CheckoutPhase.PHONE: "Quand vous êtes prêt, quel est le meilleur numéro de téléphone ?",
+                            CheckoutPhase.PHONE_CONFIRM: "Quand vous êtes prêt, est-ce que le numéro est correct ?",
+                            CheckoutPhase.EMAIL: "Quand vous êtes prêt, quelle est l'adresse email ?",
+                            CheckoutPhase.EMAIL_CONFIRM: "Quand vous êtes prêt, est-ce que l'email est correct ?",
+                        }
+                    else:
+                        prompt_by_phase = {
+                            CheckoutPhase.ORDERING: "When you're ready, what would you like from the menu?",
+                            CheckoutPhase.NAME: "When you're ready, what name should I put on the order?",
+                            CheckoutPhase.NAME_CONFIRM: "When you're ready, is the name correct?",
+                            CheckoutPhase.ADDRESS: "When you're ready, what's the delivery address?",
+                            CheckoutPhase.ADDRESS_CONFIRM: "When you're ready, is the address correct?",
+                            CheckoutPhase.PHONE: "When you're ready, what's the best phone number?",
+                            CheckoutPhase.PHONE_CONFIRM: "When you're ready, is that phone number correct?",
+                            CheckoutPhase.EMAIL: "When you're ready, what's the email address?",
+                            CheckoutPhase.EMAIL_CONFIRM: "When you're ready, is the email correct?",
+                        }
+
+                    prompt = prompt_by_phase.get(phase) or (
+                        "Quand vous êtes prêt, dites-moi ce que vous voulez."
+                        if lang == "fr"
+                        else "When you're ready, tell me what you'd like."
+                    )
+
+                self._silence_checkin_count += 1
+                self._last_silence_prompt_time = now
+
+                logger.debug(
+                    "Silence check-in",
+                    call_sid=self.call_sid,
+                    stream_sid=self.stream_sid,
+                    count=self._silence_checkin_count,
+                    silence_s=round(silence_duration, 2),
+                    delay_s=round(delay_s, 2),
+                )
+
+                await self._speak_response(prompt, tone_mode=ToneMode.CHECK_IN, language=lang)
                      
         except asyncio.CancelledError:
             pass

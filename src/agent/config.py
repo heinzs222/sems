@@ -93,6 +93,14 @@ class Config:
     company_name: str = "Sesame AI"
     max_history_turns: int = 10
     silence_timeout_seconds: float = 1.5
+
+    # Silence check-ins (human-style, non-spammy)
+    # - first: seconds after the agent finishes speaking with no user speech
+    # - next: seconds between subsequent check-ins (if still silent)
+    # - max_prompts: maximum check-ins before going quiet again until user speaks
+    silence_checkin_first_s: float = 12.0
+    silence_checkin_next_s: float = 25.0
+    silence_checkin_max_prompts: int = 2
     min_interruption_words: int = 3
 
     # Audio pacing / jitter buffer (Twilio PSTN is jittery; this smooths outbound playback)
@@ -182,6 +190,9 @@ class Config:
             outlines_enabled=self.outlines_enabled,
             agent_name=self.agent_name,
             min_interruption_words=self.min_interruption_words,
+            silence_checkin_first_s=self.silence_checkin_first_s,
+            silence_checkin_next_s=self.silence_checkin_next_s,
+            silence_checkin_max_prompts=self.silence_checkin_max_prompts,
             jitter_buffer_ms=self.jitter_buffer_ms,
             jitter_buffer_min_ms=self.jitter_buffer_min_ms,
             jitter_buffer_max_ms=self.jitter_buffer_max_ms,
@@ -290,6 +301,9 @@ def get_config() -> Config:
         company_name=os.getenv("COMPANY_NAME", "Sesame AI"),
         max_history_turns=_get_int("MAX_HISTORY_TURNS", 10),
         silence_timeout_seconds=_get_float("SILENCE_TIMEOUT_SECONDS", 1.5),
+        silence_checkin_first_s=_get_float("SILENCE_CHECKIN_FIRST_S", 12.0),
+        silence_checkin_next_s=_get_float("SILENCE_CHECKIN_NEXT_S", 25.0),
+        silence_checkin_max_prompts=_get_int("SILENCE_CHECKIN_MAX_PROMPTS", 2),
         min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 3),
 
         # Audio pacing / jitter buffer
