@@ -54,8 +54,13 @@ def configure_logging(log_level: str = "INFO") -> None:
     # Set log level
     logging.basicConfig(
         format="%(message)s",
+        stream=sys.stdout,
         level=getattr(logging, log_level.upper(), logging.INFO),
     )
+
+    # Reduce noisy third-party INFO logs in production (Railway may surface them as errors).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = structlog.get_logger(__name__)
 
@@ -101,7 +106,7 @@ async def lifespan(app: FastAPI):
         await initialize_llm()
         
         # Initialize semantic router (lazy, but warm up)
-        if config.router_enabled:
+        if config.router_enabled and not config.menu_only:
             from src.agent.routing import initialize_router
             initialize_router()
         
