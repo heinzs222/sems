@@ -2089,11 +2089,23 @@ class VoicePipeline:
                 self._barge_in_partial_words = word_count
                 self._barge_in_is_backchannel = self._is_barge_in_backchannel(text)
 
-                if not self._tts_soft_paused and (self._speech_started_during_tts or word_count >= 1):
+                # Avoid soft-pausing the agent for short backchannels ("ok", "yeah", "oui", ...)
+                # which can cause audible stutter/ticking if they occur frequently.
+                soft_word_threshold = max(1, self.config.min_interruption_words - 1)
+                should_soft_interrupt = (
+                    self._contains_hard_interrupt_phrase(text)
+                    or (
+                        not self._barge_in_is_backchannel
+                        and (self._speech_started_during_tts or word_count >= soft_word_threshold)
+                    )
+                )
+
+                if not self._tts_soft_paused and should_soft_interrupt:
                     self._begin_soft_interrupt(
                         reason="speech_started" if self._speech_started_during_tts else "interim"
                     )
-                    self._speech_started_during_tts = False
+
+                self._speech_started_during_tts = False
 
                 if self._contains_hard_interrupt_phrase(text):
                     logger.info(

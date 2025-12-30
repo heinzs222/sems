@@ -77,7 +77,7 @@ class Config:
     company_name: str = "Sesame AI"
     max_history_turns: int = 10
     silence_timeout_seconds: float = 1.5
-    min_interruption_words: int = 2
+    min_interruption_words: int = 3
 
     # Audio pacing / jitter buffer (Twilio PSTN is jittery; this smooths outbound playback)
     # - jitter_buffer_ms: initial target prebuffer before starting an audio burst
@@ -247,7 +247,7 @@ def get_config() -> Config:
         company_name=os.getenv("COMPANY_NAME", "Sesame AI"),
         max_history_turns=_get_int("MAX_HISTORY_TURNS", 10),
         silence_timeout_seconds=_get_float("SILENCE_TIMEOUT_SECONDS", 1.5),
-        min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 2),
+        min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 3),
 
         # Audio pacing / jitter buffer
         jitter_buffer_ms=_get_int("JITTER_BUFFER_MS", 160),
