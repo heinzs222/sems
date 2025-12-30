@@ -50,10 +50,26 @@ class Config:
     deepgram_eot_threshold: float = 0.72
     deepgram_eot_timeout_ms: int = 4500
     
+    # TTS Provider
+    # - "cartesia": Cartesia API (default, low latency, CPU-friendly)
+    # - "openai": OpenAI Audio Speech API (non-streaming in this repo)
+    # - "csm": Contextual TTS via a GPU microservice (see csm_service/)
+    tts_provider: str = "cartesia"  # "cartesia" | "openai" | "csm"
+    
     # Cartesia (TTS)
     cartesia_api_key: str = ""
     cartesia_voice_id: str = "a0e99841-438c-4a64-b679-ae501e7d6091"
     cartesia_voice_id_fr: str = "dd951538-c475-4bde-a3f7-9fd7b3e4d8f5"
+
+    # OpenAI (TTS)
+    openai_tts_model: str = "gpt-4o-mini-tts"
+    openai_tts_voice: str = "alloy"
+
+    # CSM Microservice (contextual TTS)
+    csm_endpoint: str = ""
+    csm_timeout_ms: int = 2500
+    csm_max_context_seconds: float = 24.0
+    csm_voice_style: str = "default"
     
     # Groq (LLM)
     groq_api_key: str = ""
@@ -110,8 +126,17 @@ class Config:
             missing.append("TWILIO_AUTH_TOKEN")
         if not self.deepgram_api_key:
             missing.append("DEEPGRAM_API_KEY")
-        if not self.cartesia_api_key:
+        tts = (self.tts_provider or "cartesia").strip().lower()
+        if tts not in ("cartesia", "openai", "csm"):
+            raise ConfigError(
+                f"Invalid TTS_PROVIDER '{self.tts_provider}'. Expected 'cartesia', 'openai', or 'csm'."
+            )
+        if tts in ("cartesia", "csm") and not self.cartesia_api_key:
             missing.append("CARTESIA_API_KEY")
+        if tts == "openai" and not self.openai_api_key:
+            missing.append("OPENAI_API_KEY")
+        if tts == "csm" and not self.csm_endpoint:
+            missing.append("CSM_ENDPOINT")
         provider = (self.llm_provider or "groq").strip().lower()
         if provider not in ("groq", "openai"):
             raise ConfigError(
@@ -149,6 +174,7 @@ class Config:
             deepgram_eager_eot_threshold=self.deepgram_eager_eot_threshold,
             deepgram_eot_threshold=self.deepgram_eot_threshold,
             deepgram_eot_timeout_ms=self.deepgram_eot_timeout_ms,
+            tts_provider=self.tts_provider,
             llm_provider=self.llm_provider,
             llm_model=self.openai_model if self.llm_provider == "openai" else self.groq_model,
             router_enabled=self.router_enabled,
@@ -161,6 +187,10 @@ class Config:
             jitter_buffer_max_ms=self.jitter_buffer_max_ms,
             jitter_buffer_adapt_step_ms=self.jitter_buffer_adapt_step_ms,
             jitter_buffer_idle_threshold_ms=self.jitter_buffer_idle_threshold_ms,
+            csm_endpoint_set=bool(self.csm_endpoint),
+            csm_timeout_ms=self.csm_timeout_ms,
+            csm_max_context_seconds=self.csm_max_context_seconds,
+            csm_voice_style=self.csm_voice_style,
             twilio_sid_prefix=self.twilio_account_sid[:6] + "..." if self.twilio_account_sid else "NOT SET",
             deepgram_key_set=bool(self.deepgram_api_key),
             cartesia_key_set=bool(self.cartesia_api_key),
@@ -222,10 +252,23 @@ def get_config() -> Config:
         deepgram_eot_threshold=_get_float("DEEPGRAM_EOT_THRESHOLD", 0.72),
         deepgram_eot_timeout_ms=_get_int("DEEPGRAM_EOT_TIMEOUT_MS", 4500),
         
+        # TTS Provider
+        tts_provider=os.getenv("TTS_PROVIDER", "cartesia").strip().lower(),
+        
         # Cartesia
         cartesia_api_key=os.getenv("CARTESIA_API_KEY", ""),
         cartesia_voice_id=os.getenv("CARTESIA_VOICE_ID", "a0e99841-438c-4a64-b679-ae501e7d6091"),
         cartesia_voice_id_fr=os.getenv("CARTESIA_VOICE_ID_FR", "dd951538-c475-4bde-a3f7-9fd7b3e4d8f5"),
+
+        # OpenAI (TTS)
+        openai_tts_model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
+        openai_tts_voice=os.getenv("OPENAI_TTS_VOICE", "alloy"),
+
+        # CSM Microservice (contextual TTS)
+        csm_endpoint=os.getenv("CSM_ENDPOINT", "").strip(),
+        csm_timeout_ms=_get_int("CSM_TIMEOUT_MS", 2500),
+        csm_max_context_seconds=_get_float("CSM_MAX_CONTEXT_SECONDS", 24.0),
+        csm_voice_style=os.getenv("CSM_VOICE_STYLE", "default").strip(),
         
         # Groq
         groq_api_key=os.getenv("GROQ_API_KEY", ""),

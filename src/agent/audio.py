@@ -10,7 +10,9 @@ This eliminates CPU-heavy resampling that causes choppy audio.
 """
 
 import audioop
-from typing import Generator, List
+import io
+import wave
+from typing import Generator, List, Optional
 import struct
 
 TWILIO_SAMPLE_RATE = 8000
@@ -167,6 +169,7 @@ def tts_pcm_to_twilio_ulaw(
         pcm_bytes = audioop.lin2lin(pcm_bytes, 1, 2)
     elif source_width == 4:
         # 32-bit float to 16-bit int
+        import numpy as np  # Local import (optional code path)
         samples = np.frombuffer(pcm_bytes, dtype=np.float32)
         samples = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
         pcm_bytes = samples.tobytes()
@@ -202,6 +205,31 @@ def pcm_8k_to_ulaw(pcm_bytes: bytes) -> bytes:
     if not pcm_bytes:
         return b""
     return audioop.lin2ulaw(pcm_bytes, 2)
+
+
+# Alias for compatibility with CSM TTS
+pcm_to_ulaw = pcm_8k_to_ulaw
+
+
+def resample_audio(pcm_bytes: bytes, from_rate: int, to_rate: int) -> bytes:
+    """
+    Resample linear PCM audio between any two sample rates.
+    
+    Used by CSM TTS to convert 24kHz output to 8kHz for Twilio.
+    
+    Args:
+        pcm_bytes: Linear PCM 16-bit bytes
+        from_rate: Source sample rate in Hz
+        to_rate: Target sample rate in Hz
+        
+    Returns:
+        Resampled PCM 16-bit bytes
+    """
+    if not pcm_bytes or from_rate == to_rate:
+        return pcm_bytes
+    
+    converted, _ = audioop.ratecv(pcm_bytes, 2, 1, from_rate, to_rate, None)
+    return converted
 
 
 def chunk_audio(audio_bytes: bytes, chunk_size: int = TWILIO_FRAME_SIZE) -> Generator[bytes, None, None]:
@@ -289,6 +317,8 @@ def normalize_audio(pcm_bytes: bytes, target_db: float = -3.0) -> bytes:
     """
     if not pcm_bytes:
         return b""
+
+    import numpy as np  # Local import (optional utility)
     
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
     
@@ -312,3 +342,97 @@ def normalize_audio(pcm_bytes: bytes, target_db: float = -3.0) -> bytes:
     normalized = np.clip(normalized, -32768, 32767).astype(np.int16)
     
     return normalized.tobytes()
+
+
+def resample_pcm16(pcm_bytes: bytes, source_rate: int, target_rate: int) -> bytes:
+    """
+    Resample mono 16-bit PCM from `source_rate` to `target_rate` using `audioop.ratecv`.
+    """
+    if not pcm_bytes or source_rate == target_rate:
+        return pcm_bytes
+    converted, _ = audioop.ratecv(pcm_bytes, 2, 1, int(source_rate), int(target_rate), None)
+    return converted
+
+
+def read_wav_mono_pcm16(wav_bytes: bytes) -> tuple[int, bytes]:
+    """
+    Read a WAV byte string and return (sample_rate, mono PCM16 bytes).
+
+    - If input is stereo, it is downmixed to mono.
+    - If sample width is not 16-bit, raises ValueError.
+    """
+    if not wav_bytes:
+        raise ValueError("Empty WAV")
+
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_width = wf.getsampwidth()
+        sample_rate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+
+    if sample_width != 2:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width * 8} bits")
+
+    if channels == 1:
+        return int(sample_rate), frames
+
+    if channels == 2:
+        mono = audioop.tomono(frames, 2, 0.5, 0.5)
+        return int(sample_rate), mono
+
+    raise ValueError(f"Unsupported WAV channel count: {channels}")
+
+
+def write_wav_mono_pcm16(pcm_bytes: bytes, sample_rate: int) -> bytes:
+    """Create a mono 16-bit PCM WAV byte string from PCM bytes."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(pcm_bytes or b"")
+    return buf.getvalue()
+
+
+def trim_wav_bytes(wav_bytes: bytes, *, max_seconds: float) -> bytes:
+    """Trim a mono/stereo PCM16 WAV byte string to at most `max_seconds`."""
+    if not wav_bytes:
+        return wav_bytes
+    if max_seconds <= 0:
+        return write_wav_mono_pcm16(b"", 24000)
+
+    sr, pcm = read_wav_mono_pcm16(wav_bytes)
+    max_samples = int(sr * max_seconds)
+    max_bytes = max_samples * 2
+    if len(pcm) <= max_bytes:
+        return write_wav_mono_pcm16(pcm, sr)
+    return write_wav_mono_pcm16(pcm[:max_bytes], sr)
+
+
+def ulaw_8k_to_wav_24k(ulaw_bytes: bytes, *, max_seconds: Optional[float] = None) -> bytes:
+    """
+    Convert Twilio 8kHz mu-law bytes to a 24kHz mono PCM16 WAV byte string.
+
+    This is used for contextual TTS history; it is not played directly to Twilio.
+    """
+    if not ulaw_bytes:
+        return write_wav_mono_pcm16(b"", 24000)
+
+    if max_seconds is not None and max_seconds > 0:
+        max_bytes = int(8000 * max_seconds)
+        ulaw_bytes = ulaw_bytes[-max_bytes:]
+
+    pcm_8k = ulaw_to_linear16(ulaw_bytes)
+    pcm_24k = resample_pcm16(pcm_8k, 8000, 24000)
+    return write_wav_mono_pcm16(pcm_24k, 24000)
+
+
+def wav_bytes_to_twilio_ulaw(wav_bytes: bytes) -> bytes:
+    """
+    Convert a (24kHz recommended) PCM16 WAV byte string into Twilio 8kHz mu-law bytes.
+
+    This is the bridge for contextual TTS models that output high-rate WAV audio.
+    """
+    sr, pcm = read_wav_mono_pcm16(wav_bytes)
+    pcm_8k = resample_pcm16(pcm, sr, 8000)
+    return linear16_to_ulaw(pcm_8k)

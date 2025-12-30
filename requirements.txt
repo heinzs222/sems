@@ -34,7 +34,11 @@ semantic-router[fastembed]==0.1.12
 fastembed==0.3.6
 
 # Audio
-# numpy and scipy removed - using audioop for mu-law conversion
+# numpy is used in tests and optional utility code paths.
+numpy
+
+# Contextual TTS microservice dependencies (torch/transformers) are isolated to:
+# `csm_service/requirements.txt` so Railway CPU deploys stay lightweight.
 
 # Async
 aiofiles==24.1.0

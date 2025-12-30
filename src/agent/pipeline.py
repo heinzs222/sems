@@ -30,7 +30,7 @@ import structlog
 from twilio.rest import Client as TwilioClient
 
 from src.agent.config import get_config, Config
-from src.agent.audio import twilio_ulaw_passthrough, chunk_audio, TWILIO_FRAME_SIZE
+from src.agent.audio import twilio_ulaw_passthrough, chunk_audio, TWILIO_FRAME_SIZE, TWILIO_SAMPLE_RATE
 from src.agent.twilio_protocol import (
     TwilioProtocolHandler,
     TwilioEventType,
@@ -59,6 +59,7 @@ from src.agent.menu import (
     find_menu_items,
     find_menu_sections,
 )
+from src.agent.voice_context import VoiceContextBuffer
 
 logger = structlog.get_logger(__name__)
 
@@ -251,6 +252,7 @@ class QueuedTranscript:
     stt_latency_ms: float = 0.0
     detected_language: Optional[str] = None
     language_confidence: Optional[float] = None
+    audio_ulaw_8k: Optional[bytes] = None
 
 
 @dataclass(frozen=True)
@@ -329,6 +331,13 @@ class VoicePipeline:
         self._router: Optional[SemanticRouter] = None
         self._extraction_queue: Optional[ExtractionQueue] = None
         self._menu_catalog = None
+
+        # Contextual TTS history (used when TTS_PROVIDER=csm).
+        self._voice_context = VoiceContextBuffer(max_context_seconds=self.config.csm_max_context_seconds)
+
+        # Rolling inbound user audio (8kHz mu-law) for short context snippets.
+        self._inbound_ulaw_history: bytearray = bytearray()
+        self._inbound_ulaw_history_max_bytes: int = int(TWILIO_SAMPLE_RATE * 8)  # ~8 seconds
         
         # State
         self._state = PipelineState.IDLE
@@ -1660,6 +1669,10 @@ class VoicePipeline:
         self._last_audio_frame_time = now
         self._last_speech_activity_time = now
         self._last_silence_prompt_time = 0.0
+
+        # Reset per-call contextual buffers.
+        self._inbound_ulaw_history.clear()
+        self._voice_context = VoiceContextBuffer(max_context_seconds=self.config.csm_max_context_seconds)
         logger.info(
             "Call started",
             call_sid=event.call_sid,
@@ -1705,6 +1718,15 @@ class VoicePipeline:
         audio = twilio_ulaw_passthrough(event.payload)
         
         if audio:
+            # Keep a rolling buffer of the caller audio for contextual TTS (CSM mode).
+            if (self.config.tts_provider or "cartesia").strip().lower() == "csm":
+                try:
+                    self._inbound_ulaw_history.extend(audio)
+                    if len(self._inbound_ulaw_history) > self._inbound_ulaw_history_max_bytes:
+                        del self._inbound_ulaw_history[:-self._inbound_ulaw_history_max_bytes]
+                except Exception:
+                    self._inbound_ulaw_history = bytearray(audio[-self._inbound_ulaw_history_max_bytes :])
+
             if not self._logged_first_media:
                 self._logged_first_media = True
                 logger.info(
@@ -1915,6 +1937,11 @@ class VoicePipeline:
 
         return False
 
+    def _snapshot_recent_user_ulaw(self) -> Optional[bytes]:
+        if not self._inbound_ulaw_history:
+            return None
+        return bytes(self._inbound_ulaw_history)
+
     async def _enqueue_turn_transcript(
         self,
         *,
@@ -1924,6 +1951,10 @@ class VoicePipeline:
         language_confidence: Optional[float],
         source: str,
     ) -> None:
+        audio_ulaw: Optional[bytes] = None
+        if (self.config.tts_provider or "cartesia").strip().lower() == "csm":
+            audio_ulaw = self._snapshot_recent_user_ulaw()
+
         logger.info(
             "Final transcript",
             call_sid=self.call_sid,
@@ -1939,6 +1970,7 @@ class VoicePipeline:
                 stt_latency_ms=stt_latency_ms,
                 detected_language=detected_language,
                 language_confidence=language_confidence,
+                audio_ulaw_8k=audio_ulaw,
             )
         )
 
@@ -2616,6 +2648,20 @@ class VoicePipeline:
         self._start_turn()
         if self._current_turn_metrics:
             self._current_turn_metrics.stt_ms = queued.stt_latency_ms
+
+        # Feed the contextual TTS buffer with the latest user turn (best-effort).
+        try:
+            tts_provider = (self.config.tts_provider or "cartesia").strip().lower()
+            if tts_provider == "csm":
+                self._voice_context.add_turn(
+                    role="user",
+                    text=queued.text,
+                    audio_ulaw_8k=queued.audio_ulaw_8k,
+                )
+            else:
+                self._voice_context.add_turn(role="user", text=queued.text)
+        except Exception:
+            pass
         
         try:
             await self._process_transcript(
@@ -2886,7 +2932,27 @@ class VoicePipeline:
         
         # Start pacer if not running
         await self._start_pacer()
-        
+
+        tts_provider = (self.config.tts_provider or "cartesia").strip().lower()
+        context_payload: Optional[list[dict]] = None
+        if tts_provider == "csm":
+            try:
+                context_payload = self._voice_context.build_payload()
+            except Exception:
+                context_payload = None
+
+        # Capture a short tail of what we actually send (for fallback context snippets).
+        snippet_cap_s = 0.0
+        if tts_provider == "csm":
+            window_s = float(self.config.csm_max_context_seconds or 0.0)
+            if window_s > 0:
+                snippet_cap_s = min(6.0, max(3.0, window_s / 4.0))
+        tail_max_bytes = int(TWILIO_SAMPLE_RATE * snippet_cap_s) if snippet_cap_s > 0 else 0
+        assistant_ulaw_tail = bytearray()
+        assistant_wav_24k: Optional[bytes] = None
+        was_cancelled = False
+        was_interrupted = False
+
         try:
             # Reset streaming frame remainder for this utterance.
             # Important: Do NOT pad to 160 bytes per TTS chunk; only pad once at the end,
@@ -2895,17 +2961,29 @@ class VoicePipeline:
 
             voice_id = self._current_cartesia_voice_id(language=lang)
 
+            # For CSM, synthesize the full utterance in one request to preserve prosody and
+            # reduce network roundtrips; keep sentence marks for fast streaming providers.
+            segments = [text] if tts_provider == "csm" else self._split_sentences(text)
+
             # Best practice: Insert marks at sentence boundaries to track real playback and
             # make interruptions feel clean.
-            for segment in self._split_sentences(text):
+            for segment in segments:
                 if not self._is_running or self._state == PipelineState.INTERRUPTED:
                     break
 
-                async for chunk in self._tts.synthesize_streaming(segment, voice_id=voice_id):
+                async for chunk in self._tts.synthesize_streaming(
+                    segment,
+                    voice_id=voice_id,
+                    context=context_payload,
+                    language=lang,
+                ):
                     if not self._is_running or self._state == PipelineState.INTERRUPTED:
                         break
 
                     if chunk.audio_bytes:
+                        if chunk.audio_wav_24k and assistant_wav_24k is None:
+                            assistant_wav_24k = chunk.audio_wav_24k
+
                         if first_audio_time is None:
                             first_audio_time = time.time()
                             if self._current_turn_metrics:
@@ -2922,6 +3000,10 @@ class VoicePipeline:
                         ):
                             frame = self._outbound_ulaw_remainder[:TWILIO_FRAME_SIZE]
                             self._outbound_ulaw_remainder = self._outbound_ulaw_remainder[TWILIO_FRAME_SIZE:]
+                            if tail_max_bytes > 0:
+                                assistant_ulaw_tail += frame
+                                if len(assistant_ulaw_tail) > tail_max_bytes:
+                                    del assistant_ulaw_tail[:-tail_max_bytes]
                             msg = create_media_message(self._protocol.stream_sid, frame)
                             await self._enqueue_outbound(msg, pace=True)
 
@@ -2932,6 +3014,10 @@ class VoicePipeline:
                     ):
                         frame = self._outbound_ulaw_remainder.ljust(TWILIO_FRAME_SIZE, b"\xff")
                         self._outbound_ulaw_remainder = b""
+                        if tail_max_bytes > 0:
+                            assistant_ulaw_tail += frame
+                            if len(assistant_ulaw_tail) > tail_max_bytes:
+                                del assistant_ulaw_tail[:-tail_max_bytes]
                         msg = create_media_message(self._protocol.stream_sid, frame)
                         await self._enqueue_outbound(msg, pace=True)
 
@@ -2947,12 +3033,20 @@ class VoicePipeline:
                     while len(self._outbound_ulaw_remainder) >= TWILIO_FRAME_SIZE:
                         frame = self._outbound_ulaw_remainder[:TWILIO_FRAME_SIZE]
                         self._outbound_ulaw_remainder = self._outbound_ulaw_remainder[TWILIO_FRAME_SIZE:]
+                        if tail_max_bytes > 0:
+                            assistant_ulaw_tail += frame
+                            if len(assistant_ulaw_tail) > tail_max_bytes:
+                                del assistant_ulaw_tail[:-tail_max_bytes]
                         msg = create_media_message(self._protocol.stream_sid, frame)
                         await self._enqueue_outbound(msg, pace=True)
 
                     if self._outbound_ulaw_remainder:
                         frame = self._outbound_ulaw_remainder.ljust(TWILIO_FRAME_SIZE, b"\xff")
                         self._outbound_ulaw_remainder = b""
+                        if tail_max_bytes > 0:
+                            assistant_ulaw_tail += frame
+                            if len(assistant_ulaw_tail) > tail_max_bytes:
+                                del assistant_ulaw_tail[:-tail_max_bytes]
                         msg = create_media_message(self._protocol.stream_sid, frame)
                         await self._enqueue_outbound(msg, pace=True)
 
@@ -2966,11 +3060,33 @@ class VoicePipeline:
             
         except asyncio.CancelledError:
             logger.debug("TTS streaming cancelled")
+            was_cancelled = True
         except Exception as e:
             logger.error("TTS streaming failed", error=str(e))
         finally:
+            was_interrupted = self._state == PipelineState.INTERRUPTED
             if self._state == PipelineState.SPEAKING:
                 self._state = PipelineState.LISTENING
+
+            if self._is_running and not was_cancelled and not was_interrupted:
+                try:
+                    if tts_provider == "csm":
+                        if assistant_wav_24k:
+                            self._voice_context.add_turn(
+                                role="assistant",
+                                text=text,
+                                audio_wav_24k=assistant_wav_24k,
+                            )
+                        else:
+                            self._voice_context.add_turn(
+                                role="assistant",
+                                text=text,
+                                audio_ulaw_8k=bytes(assistant_ulaw_tail) if assistant_ulaw_tail else None,
+                            )
+                    else:
+                        self._voice_context.add_turn(role="assistant", text=text)
+                except Exception:
+                    pass
     
     async def _play_cached_audio(self, audio_chunks: List[bytes]) -> None:
         """
