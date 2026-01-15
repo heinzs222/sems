@@ -33,6 +33,8 @@ If you want the closest “ChatGPT Voice” style interaction, use the OpenAI Re
 - Set `VOICE_MODE=openai_realtime` (or `VOICE_MODE=auto` with `OPENAI_API_KEY` set)
 - Set `OPENAI_API_KEY`
 - Optional: `OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1` to get Whisper transcripts in logs
+- Optional: `OPENAI_REALTIME_INSTRUCTIONS_FILE=prompts/renewables_system_prompt.txt` (or set `OPENAI_REALTIME_INSTRUCTIONS`)
+- Optional: `OPENAI_REALTIME_TOOLS=renewables` to enable function tools (lead capture / scheduling)
 
 In this mode, audio goes directly:
 

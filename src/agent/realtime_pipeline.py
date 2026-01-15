@@ -26,6 +26,8 @@ import websockets
 
 from src.agent.audio import TWILIO_FRAME_SIZE
 from src.agent.config import Config, get_config
+from src.agent.prompt_utils import resolve_prompt
+from src.agent.realtime_tools import RenewablesToolExecutor, safe_json_dumps
 from src.agent.twilio_protocol import (
     TwilioProtocolHandler,
     TwilioEventType,
@@ -50,6 +52,12 @@ class RealtimeState(str, Enum):
 class OutboundMessage:
     message: str
     pace: bool = True
+
+
+@dataclass
+class _ToolCallState:
+    name: str
+    arguments: str = ""
 
 
 def _b64encode(data: bytes) -> str:
@@ -118,6 +126,10 @@ class OpenAIRealtimePipeline:
         # Response tracking / ignore late audio after barge-in.
         self._active_response_id: Optional[str] = None
         self._ignore_audio: bool = False
+
+        # Optional tool calling + per-call memory.
+        self._tool_executor: Optional[RenewablesToolExecutor] = None
+        self._tool_calls: dict[str, _ToolCallState] = {}
 
     @property
     def call_sid(self) -> str:
@@ -202,6 +214,11 @@ class OpenAIRealtimePipeline:
 
         logger.info("Call started (realtime)", call_sid=event.call_sid, stream_sid=event.stream_sid)
 
+        tools_mode = (getattr(self.config, "openai_realtime_tools", "none") or "none").strip().lower()
+        if tools_mode == "renewables":
+            self._tool_executor = RenewablesToolExecutor(config=self.config, call_sid=self.call_sid)
+            logger.info("Realtime tools enabled", tools=tools_mode)
+
         await self._start_pacer()
         await self._connect_openai()
 
@@ -211,7 +228,6 @@ class OpenAIRealtimePipeline:
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
-                    "instructions": "Greet the caller briefly and ask how you can help.",
                 },
             }
         )
@@ -300,6 +316,13 @@ class OpenAIRealtimePipeline:
         instructions = (self.config.openai_realtime_instructions or "").strip() or _default_realtime_instructions(
             self.config
         )
+        file_instructions = resolve_prompt(
+            config=self.config,
+            inline_text=self.config.openai_realtime_instructions,
+            file_path=self.config.openai_realtime_instructions_file,
+        )
+        if file_instructions:
+            instructions = file_instructions
 
         session: dict[str, Any] = {
             "modalities": ["audio", "text"],
@@ -317,6 +340,10 @@ class OpenAIRealtimePipeline:
         transcription_model = (getattr(self.config, "openai_realtime_transcription_model", "") or "").strip()
         if transcription_model:
             session["input_audio_transcription"] = {"model": transcription_model}
+
+        if self._tool_executor:
+            session["tools"] = self._tool_executor.tool_definitions()
+            session["tool_choice"] = "auto"
 
         await self._openai_send(
             {
@@ -422,6 +449,69 @@ class OpenAIRealtimePipeline:
                     delta = event.get("delta") or event.get("audio")
                     if isinstance(delta, str) and delta:
                         await self._enqueue_openai_audio(_b64decode(delta))
+                    continue
+
+                if event_type == "response.output_item.added":
+                    item = event.get("item") or {}
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        call_id = item.get("call_id")
+                        name = item.get("name")
+                        if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                            self._tool_calls[call_id] = _ToolCallState(name=name)
+                    continue
+
+                if event_type == "response.function_call_arguments.delta":
+                    call_id = event.get("call_id")
+                    delta = event.get("delta")
+                    if (
+                        isinstance(call_id, str)
+                        and call_id
+                        and isinstance(delta, str)
+                        and delta
+                        and call_id in self._tool_calls
+                    ):
+                        self._tool_calls[call_id].arguments += delta
+                    continue
+
+                if event_type == "response.function_call_arguments.done":
+                    call_id = event.get("call_id")
+                    arguments = event.get("arguments")
+                    if not isinstance(call_id, str) or not call_id:
+                        continue
+
+                    call = self._tool_calls.pop(call_id, None)
+                    if not call:
+                        continue
+
+                    args_text = arguments if isinstance(arguments, str) and arguments else call.arguments
+                    try:
+                        args_obj = json.loads(args_text) if args_text else {}
+                    except Exception:
+                        args_obj = {}
+
+                    if not self._tool_executor:
+                        output_obj = {"ok": False, "error": "tools_not_enabled"}
+                    else:
+                        output_obj = await self._tool_executor.execute(call.name, args_obj)
+
+                    await self._openai_send(
+                        {
+                            "type": "conversation.item.create",
+                            "item": {
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": safe_json_dumps(output_obj),
+                            },
+                        }
+                    )
+
+                    # Ask the model to continue (speak) after the tool result is added.
+                    await self._openai_send(
+                        {
+                            "type": "response.create",
+                            "response": {"modalities": ["audio", "text"]},
+                        }
+                    )
                     continue
 
                 # Optional: log transcripts for debugging (no user-facing text in PSTN).

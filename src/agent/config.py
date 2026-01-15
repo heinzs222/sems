@@ -76,7 +76,9 @@ class Config:
     openai_realtime_voice: str = "alloy"
     openai_realtime_turn_silence_ms: int = 350
     openai_realtime_instructions: str = ""
+    openai_realtime_instructions_file: str = ""
     openai_realtime_transcription_model: str = "whisper-1"
+    openai_realtime_tools: str = "none"  # "none" | "renewables"
 
     # CSM Microservice (contextual TTS)
     csm_endpoint: str = ""
@@ -105,6 +107,9 @@ class Config:
     # Agent settings
     agent_name: str = "Sesame"
     company_name: str = "Sesame AI"
+    # Optional: override the pipeline LLM system prompt (text or file).
+    system_prompt: str = ""
+    system_prompt_file: str = ""
     max_history_turns: int = 10
     silence_timeout_seconds: float = 1.5
 
@@ -264,6 +269,7 @@ class Config:
             openai_realtime_model=self.openai_realtime_model,
             openai_realtime_voice=self.openai_realtime_voice,
             openai_realtime_turn_silence_ms=self.openai_realtime_turn_silence_ms,
+            openai_realtime_tools=self.openai_realtime_tools,
             openai_realtime_transcription_model=self.openai_realtime_transcription_model,
             twilio_sid_prefix=self.twilio_account_sid[:6] + "..." if self.twilio_account_sid else "NOT SET",
             deepgram_key_set=bool(self.deepgram_api_key),
@@ -353,10 +359,12 @@ def get_config() -> Config:
         openai_realtime_voice=os.getenv("OPENAI_REALTIME_VOICE", os.getenv("OPENAI_TTS_VOICE", "alloy")),
         openai_realtime_turn_silence_ms=_get_int("OPENAI_REALTIME_TURN_SILENCE_MS", 350),
         openai_realtime_instructions=os.getenv("OPENAI_REALTIME_INSTRUCTIONS", "").strip(),
+        openai_realtime_instructions_file=os.getenv("OPENAI_REALTIME_INSTRUCTIONS_FILE", "").strip(),
         openai_realtime_transcription_model=os.getenv(
             "OPENAI_REALTIME_TRANSCRIPTION_MODEL",
             "whisper-1",
         ).strip(),
+        openai_realtime_tools=os.getenv("OPENAI_REALTIME_TOOLS", "none").strip().lower(),
 
         # CSM Microservice (contextual TTS)
         csm_endpoint=os.getenv("CSM_ENDPOINT", "").strip(),
@@ -383,6 +391,8 @@ def get_config() -> Config:
         # Agent settings
         agent_name=os.getenv("AGENT_NAME", "Sesame"),
         company_name=os.getenv("COMPANY_NAME", "Sesame AI"),
+        system_prompt=os.getenv("SYSTEM_PROMPT", "").strip(),
+        system_prompt_file=os.getenv("SYSTEM_PROMPT_FILE", "").strip(),
         max_history_turns=_get_int("MAX_HISTORY_TURNS", 10),
         silence_timeout_seconds=_get_float("SILENCE_TIMEOUT_SECONDS", 1.5),
         turn_end_grace_ms=_get_int("TURN_END_GRACE_MS", 650),

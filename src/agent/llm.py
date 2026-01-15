@@ -19,6 +19,7 @@ import structlog
 from openai import AsyncOpenAI
 
 from src.agent.config import get_config
+from src.agent.prompt_utils import resolve_prompt
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +84,14 @@ def get_system_prompt(config: Optional[Any] = None, target_language: str = "en")
     """
     if config is None:
         config = get_config()
+
+    override = resolve_prompt(
+        config=config,
+        inline_text=getattr(config, "system_prompt", ""),
+        file_path=getattr(config, "system_prompt_file", ""),
+    )
+    if override:
+        return override
 
     language_norm = (target_language or "en").strip().lower()
     is_french = language_norm.startswith("fr")
