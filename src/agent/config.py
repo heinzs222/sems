@@ -94,6 +94,16 @@ class Config:
     max_history_turns: int = 10
     silence_timeout_seconds: float = 1.5
 
+    # Turn-taking (avoid cutting callers off during short thinking pauses)
+    # - grace: base hold after end-of-utterance before we act on a "final" transcript
+    # - fallback: hold used when Deepgram emits is_final without speech_final
+    # - short_utterance: extra patience for very short fragments (often mid-thought)
+    # - incomplete: extra patience when the last token looks unfinished ("and", "mais", "...")
+    turn_end_grace_ms: int = 650
+    turn_end_fallback_ms: int = 950
+    turn_end_short_utterance_ms: int = 1200
+    turn_end_incomplete_ms: int = 1500
+
     # Silence check-ins (human-style, non-spammy)
     # - first: seconds after the agent finishes speaking with no user speech
     # - next: seconds between subsequent check-ins (if still silent)
@@ -190,6 +200,10 @@ class Config:
             outlines_enabled=self.outlines_enabled,
             agent_name=self.agent_name,
             min_interruption_words=self.min_interruption_words,
+            turn_end_grace_ms=self.turn_end_grace_ms,
+            turn_end_fallback_ms=self.turn_end_fallback_ms,
+            turn_end_short_utterance_ms=self.turn_end_short_utterance_ms,
+            turn_end_incomplete_ms=self.turn_end_incomplete_ms,
             silence_checkin_first_s=self.silence_checkin_first_s,
             silence_checkin_next_s=self.silence_checkin_next_s,
             silence_checkin_max_prompts=self.silence_checkin_max_prompts,
@@ -301,6 +315,10 @@ def get_config() -> Config:
         company_name=os.getenv("COMPANY_NAME", "Sesame AI"),
         max_history_turns=_get_int("MAX_HISTORY_TURNS", 10),
         silence_timeout_seconds=_get_float("SILENCE_TIMEOUT_SECONDS", 1.5),
+        turn_end_grace_ms=_get_int("TURN_END_GRACE_MS", 650),
+        turn_end_fallback_ms=_get_int("TURN_END_FALLBACK_MS", 950),
+        turn_end_short_utterance_ms=_get_int("TURN_END_SHORT_UTTERANCE_MS", 1200),
+        turn_end_incomplete_ms=_get_int("TURN_END_INCOMPLETE_MS", 1500),
         silence_checkin_first_s=_get_float("SILENCE_CHECKIN_FIRST_S", 12.0),
         silence_checkin_next_s=_get_float("SILENCE_CHECKIN_NEXT_S", 25.0),
         silence_checkin_max_prompts=_get_int("SILENCE_CHECKIN_MAX_PROMPTS", 2),

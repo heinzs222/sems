@@ -295,6 +295,23 @@ class CheckoutDebounceState:
     created_at: float
 
 
+@dataclass
+class TurnEndGateState:
+    """
+    Debounced end-of-turn gate to avoid cutting the caller off during short thinking pauses.
+
+    We only enqueue a "final transcript" after a short hold. Any resumed speech cancels the hold.
+    """
+
+    text: str
+    detected_language: Optional[str]
+    language_confidence: Optional[float]
+    stt_latency_ms: float
+    created_at: float
+    hold_ms: int
+    source: str
+
+
 class VoicePipeline:
     """
     Main voice pipeline orchestrator.
@@ -355,6 +372,12 @@ class VoicePipeline:
         self._customer_email: str = ""
         self._checkout_debounce: Optional[CheckoutDebounceState] = None
         self._checkout_debounce_task: Optional[asyncio.Task] = None
+
+        # Turn-taking gate: hold "finals" briefly to let the caller think/continue.
+        self._turn_end_gate: Optional[TurnEndGateState] = None
+        self._turn_end_gate_task: Optional[asyncio.Task] = None
+        self._processing_transcript_norm: str = ""
+        self._processing_started_at: float = 0.0
 
         # Track the last time we received any non-empty STT text (including interim results).
         # Used to avoid talking over the caller when Deepgram endpointing emits early finals.
@@ -1761,6 +1784,10 @@ class VoicePipeline:
             return
 
         self._last_speech_activity_time = time.time()
+        self._cancel_turn_end_gate(reason="vad_speech_started")
+        # If the caller starts talking while we're "thinking", cancel the in-flight turn.
+        if self._state == PipelineState.PROCESSING:
+            await self._cancel_processing_turn(reason="caller_resumed_while_processing")
         self._silence_checkin_count = 0
         self._last_silence_prompt_time = 0.0
         
@@ -1804,6 +1831,7 @@ class VoicePipeline:
         """Handle Flux TurnResumed (cancel speculative work)."""
         if not self._is_running:
             return
+        self._cancel_turn_end_gate(reason="flux_turn_resumed")
         self._cancel_speculative_llm(reason="flux_turn_resumed")
 
     def _start_speculative_llm(self, transcript: str, *, reason: str) -> None:
@@ -1903,6 +1931,223 @@ class VoicePipeline:
             stream_sid=self.stream_sid,
             reason=reason,
         )
+
+    def _cancel_turn_end_gate(self, *, reason: str) -> None:
+        if self._turn_end_gate_task and not self._turn_end_gate_task.done():
+            self._turn_end_gate_task.cancel()
+        self._turn_end_gate_task = None
+        self._turn_end_gate = None
+        logger.debug(
+            "Turn end gate cleared",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _merge_transcripts_for_turn_gate(existing: str, new: str) -> str:
+        """
+        Best-effort merge of consecutive Deepgram finals.
+
+        Deepgram sometimes emits a prefix-only final ("my name is") followed by the value ("Hatem"),
+        or splits numbers/words across consecutive finals. We merge conservatively to preserve info.
+        """
+        left = (existing or "").strip()
+        right = (new or "").strip()
+        if not left:
+            return right
+        if not right:
+            return left
+        if right == left:
+            return left
+
+        left_norm = _normalize_for_intent(left)
+        right_norm = _normalize_for_intent(right)
+        if not left_norm:
+            return right
+        if not right_norm:
+            return left
+
+        if right_norm.startswith(left_norm) or left_norm in right_norm:
+            return right
+        if left_norm.startswith(right_norm) or right_norm in left_norm:
+            return left
+
+        return f"{left} {right}".strip()
+
+    @staticmethod
+    def _turn_end_incomplete_tokens() -> set[str]:
+        return {
+            # English
+            "and",
+            "but",
+            "so",
+            "or",
+            "because",
+            "like",
+            "uh",
+            "um",
+            "wait",
+            "actually",
+            # French
+            "et",
+            "mais",
+            "donc",
+            "ou",
+            "parce",
+            "genre",
+            "euh",
+            "attends",
+            "enfin",
+        }
+
+    def _compute_turn_end_hold_ms(self, text: str, *, speech_final: bool) -> int:
+        base_ms = int(getattr(self.config, "turn_end_grace_ms", 650))
+        fallback_ms = int(getattr(self.config, "turn_end_fallback_ms", 950))
+        short_ms = int(getattr(self.config, "turn_end_short_utterance_ms", 1200))
+        incomplete_ms = int(getattr(self.config, "turn_end_incomplete_ms", 1500))
+
+        hold = base_ms if speech_final else max(base_ms, fallback_ms)
+
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return hold
+
+        # Keep confirmations snappy (especially in checkout confirm steps).
+        if (self._is_affirmative(cleaned) or self._is_negative(cleaned)) and len(cleaned.split()) <= 3:
+            return base_ms
+
+        if self.config.menu_only and self._checkout_phase in (
+            CheckoutPhase.NAME_CONFIRM,
+            CheckoutPhase.ADDRESS_CONFIRM,
+            CheckoutPhase.PHONE_CONFIRM,
+            CheckoutPhase.EMAIL_CONFIRM,
+        ):
+            if self._is_affirmative(cleaned) or self._is_negative(cleaned):
+                return base_ms
+
+        if self._is_barge_in_backchannel(cleaned) and len(cleaned.split()) <= 2:
+            return base_ms
+
+        normalized = _normalize_for_intent(cleaned)
+        tokens = [t for t in re.findall(r"[a-z0-9]+", normalized) if t]
+        if len(tokens) <= 4:
+            # When capturing structured info (name/address/phone/email), callers often pause
+            # briefly mid-utterance; be more patient than during ordering/chat.
+            if self.config.menu_only and self._checkout_phase in (
+                CheckoutPhase.NAME,
+                CheckoutPhase.ADDRESS,
+                CheckoutPhase.PHONE,
+                CheckoutPhase.EMAIL,
+            ):
+                hold = max(hold, short_ms)
+            else:
+                hold = max(hold, int(short_ms * 0.8))
+
+        if tokens and tokens[-1] in self._turn_end_incomplete_tokens():
+            hold = max(hold, incomplete_ms)
+
+        if cleaned.endswith(("...", "…", "-", "—")):
+            hold = max(hold, incomplete_ms)
+
+        return hold
+
+    def _schedule_turn_end_gate(
+        self,
+        *,
+        text: str,
+        stt_latency_ms: float,
+        detected_language: Optional[str],
+        language_confidence: Optional[float],
+        speech_final: bool,
+        source: str,
+    ) -> None:
+        transcript = (text or "").strip()
+        if not transcript:
+            return
+
+        hold_ms = self._compute_turn_end_hold_ms(transcript, speech_final=speech_final)
+        now = time.time()
+
+        existing = self._turn_end_gate
+        if existing:
+            transcript = self._merge_transcripts_for_turn_gate(existing.text, transcript)
+            hold_ms = max(existing.hold_ms, hold_ms)
+
+        if self._turn_end_gate_task and not self._turn_end_gate_task.done():
+            self._turn_end_gate_task.cancel()
+
+        self._turn_end_gate = TurnEndGateState(
+            text=transcript,
+            detected_language=detected_language,
+            language_confidence=language_confidence,
+            stt_latency_ms=stt_latency_ms,
+            created_at=now,
+            hold_ms=hold_ms,
+            source=source,
+        )
+        self._turn_end_gate_task = asyncio.create_task(
+            self._flush_turn_end_gate_after(created_at=now, delay_s=hold_ms / 1000.0)
+        )
+
+        logger.debug(
+            "Turn end gate armed",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            hold_ms=hold_ms,
+            source=source,
+            text=_redact_transcript_for_logs(transcript)[:80],
+        )
+
+    async def _flush_turn_end_gate_after(self, *, created_at: float, delay_s: float) -> None:
+        try:
+            await asyncio.sleep(delay_s)
+            if not self._is_running:
+                return
+
+            pending = self._turn_end_gate
+            if not pending or pending.created_at != created_at:
+                return
+
+            # If we are already speaking, we should never finalize a turn here (it would be a
+            # late transcript or echo). If we are processing, enqueue anyway; the worker is
+            # sequential and this helps when Deepgram sends late utterance-end.
+            if self._state == PipelineState.SPEAKING:
+                return
+
+            await self._enqueue_turn_transcript(
+                text=pending.text,
+                stt_latency_ms=pending.stt_latency_ms,
+                detected_language=pending.detected_language,
+                language_confidence=pending.language_confidence,
+                source=f"turn_end_gate:{pending.source}",
+            )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Clear regardless; worst case we ask again.
+            if self._turn_end_gate and self._turn_end_gate.created_at == created_at:
+                self._turn_end_gate = None
+            self._turn_end_gate_task = None
+
+    async def _cancel_processing_turn(self, *, reason: str) -> None:
+        if self._state != PipelineState.PROCESSING:
+            return
+
+        logger.info(
+            "Caller resumed while processing; cancelling turn",
+            call_sid=self.call_sid,
+            stream_sid=self.stream_sid,
+            reason=reason,
+        )
+
+        self._cancel_speculative_llm(reason="caller_resumed_processing")
+        self._cancel_checkout_debounce(reason="caller_resumed_processing")
+
+        if self._turn_task and not self._turn_task.done():
+            self._turn_task.cancel()
+        self._tts.cancel_current()
+        self._state = PipelineState.LISTENING
 
     @staticmethod
     def _meaningful_token_count(text: str) -> int:
@@ -2111,6 +2356,10 @@ class VoicePipeline:
             # Track latest interim text for Flux EagerEndOfTurn speculation.
             self._last_interim_transcript = result.text.strip()
 
+            # Any ongoing turn-end hold is invalidated by renewed speech activity.
+            if not result.is_final and not result.speech_final:
+                self._cancel_turn_end_gate(reason="interim_transcript")
+
         if not self._logged_first_transcript and result.text:
             self._logged_first_transcript = True
             logger.info(
@@ -2181,6 +2430,12 @@ class VoicePipeline:
 
             # Do not process transcripts into turns while the agent is still speaking.
             return
+
+        # If the caller starts talking while we're still processing, cancel the in-flight turn
+        # (OpenAI Voice Mode-style "thinking barge-in").
+        if self._state == PipelineState.PROCESSING and result.text and not (result.is_final or result.speech_final):
+            await self._cancel_processing_turn(reason="interim_during_processing")
+            return
         
         # Process final transcripts.
         #
@@ -2188,30 +2443,23 @@ class VoicePipeline:
         # on model + endpointing mode. Requiring it can lead to "greets but never
         # responds" if we only ever receive `is_final=true` segments.
         if result.is_final or result.speech_final:
-            transcript = result.text.strip()
-            
+            transcript = (result.text or "").strip()
             if not transcript:
                 return
-            
+
             # Use pending transcript if we were interrupted
             if self._pending_transcript:
                 transcript = self._pending_transcript
                 self._pending_transcript = ""
 
-            if await self._maybe_debounce_checkout_final(
+            # Debounce end-of-turn so we don't jump in during short thinking pauses.
+            self._schedule_turn_end_gate(
                 text=transcript,
                 stt_latency_ms=result.latency_ms,
                 detected_language=result.detected_language,
                 language_confidence=result.language_confidence,
-            ):
-                return
-
-            await self._enqueue_turn_transcript(
-                text=transcript,
-                stt_latency_ms=result.latency_ms,
-                detected_language=result.detected_language,
-                language_confidence=result.language_confidence,
-                source="stt_final",
+                speech_final=bool(result.speech_final),
+                source="speech_final" if result.speech_final else "is_final",
             )
     
     async def _handle_hard_interrupt(self, *, reason: str) -> None:

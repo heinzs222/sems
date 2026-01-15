@@ -2,27 +2,27 @@
 
 This project is a Twilio PSTN voice agent that answers inbound calls and speaks back over Twilio Media Streams (8kHz G.711 μ-law, 20ms frames).
 
-The goal of “voice presence” here is practical: make the agent feel continuous and conversational (timing, prosody consistency, interruption), while keeping the ordering/checkout flow reliable.
+"Voice presence" here means practical, phone-friendly conversation: natural pacing, consistent prosody across turns, and crisp interruptions (barge-in), without breaking the ordering/checkout flow.
 
 ## Architecture
 
-High level request/response loop:
+High-level loop:
 
 1. **Twilio → `/ws`**: inbound μ-law 8kHz audio frames (20ms).
-2. **STT (Deepgram)**: streaming transcription + speech-start events for barge-in.
-3. **LLM (Groq/OpenAI)**: generates the assistant reply text.
+2. **STT (Deepgram)**: streaming transcription + VAD events.
+3. **LLM (Groq/OpenAI)**: generates assistant reply text.
 4. **TTS (pluggable)**: turns reply text into audio.
 5. **Audio bridge**: convert to μ-law 8kHz, chunk to 20ms frames.
-6. **Outbound pacer**: queues frames and sends at steady 20ms cadence + `mark` events.
-7. **Barge-in**: if the caller starts speaking, send Twilio `clear`, cancel TTS, and listen.
+6. **Outbound pacer**: steady 20ms cadence + `mark` events.
+7. **Barge-in**: when the caller speaks, send Twilio `clear`, cancel generation, and listen.
 
 ## TTS Provider Selection
 
 Set `TTS_PROVIDER`:
 
 - `cartesia` (default): low-latency streaming TTS, CPU-friendly.
-- `openai`: simple non-streaming WAV synthesis (then converted to μ-law).
-- `csm`: **contextual** TTS via a GPU microservice, with **Cartesia fallback** for reliability.
+- `openai`: non-streaming WAV synthesis (then converted to μ-law).
+- `csm`: contextual TTS via a GPU microservice, with Cartesia fallback.
 
 Relevant env vars are in `.env.example`.
 
@@ -36,13 +36,26 @@ When `TTS_PROVIDER=csm`, the app maintains a rolling per-call buffer of recent t
 The buffer is aggressively capped:
 
 - Total window: `CSM_MAX_CONTEXT_SECONDS` (default ~24s).
-- Per-snippet cap: derived from the window (3–6 seconds).
+- Per-snippet cap: derived from the window (typically 3–6 seconds).
 
-This context is sent to the microservice on each TTS request so the model can keep voice continuity and conversational rhythm across turns.
+This context is sent to the microservice on each TTS request to encourage continuity in timing and prosody across turns.
+
+## Turn-Taking (Thinking Pauses)
+
+To avoid the agent "jumping in" while the caller is still thinking, the pipeline adds a short hold before acting on end-of-turn transcripts.
+
+Tune:
+
+- `TURN_END_GRACE_MS`: base hold after end-of-utterance.
+- `TURN_END_SHORT_UTTERANCE_MS`: extra hold for short fragments (common mid-thought).
+- `TURN_END_INCOMPLETE_MS`: extra hold when the last token looks unfinished (e.g., “and…”, “mais…”).
+- `TURN_END_FALLBACK_MS`: hold used when Deepgram emits `is_final` without `speech_final`.
+
+If the agent feels too slow, reduce these values. If it cuts callers off, increase them.
 
 ## GPU Microservice (`csm_service/`)
 
-The microservice exposes a single endpoint:
+The microservice exposes:
 
 - `POST /tts`
   - JSON body: `speaker_id`, `prompt_text`, `context[]`, plus optional generation params
@@ -79,13 +92,13 @@ Then set on Railway (main app):
 
 - `TTS_PROVIDER=csm`
 - `CSM_ENDPOINT=https://<your-csm-host>`
-- Keep `CARTESIA_API_KEY` configured for fallback.
+- Keep `CARTESIA_API_KEY` configured for fallback
 
 ## Latency + Fallback Strategy
 
 The app treats CSM as best-effort:
 
-- If CSM is slow to respond, a short backchannel (“Mm-hm.” / “Hum-hum.”) can play quickly via Cartesia.
+- If the microservice is slow to return, the main app can play a short backchannel via Cartesia.
 - If CSM errors or times out (`CSM_TIMEOUT_MS`), the turn falls back to Cartesia.
 
 ## Barge-in (Interruption)
@@ -93,21 +106,20 @@ The app treats CSM as best-effort:
 When the caller speaks while the agent is talking:
 
 1. Send Twilio `clear` (flush buffered audio).
-2. Cancel in-flight TTS generation (including remote CSM request).
+2. Cancel in-flight TTS generation (including remote CSM requests).
 3. Stop queueing outbound audio frames immediately.
-
-This keeps interruptions crisp and avoids “talking over” the caller.
 
 ## Tuning Tips
 
-- If you hear choppiness: increase `JITTER_BUFFER_MS` slightly (e.g., 160 → 200).
-- If the agent feels sluggish after interruptions: keep `JITTER_BUFFER_MIN_MS` modest (e.g., 80–120).
-- If CSM timeouts happen: raise `CSM_TIMEOUT_MS` (but keep fallback enabled).
-- If context feels “too sticky”: reduce `CSM_MAX_CONTEXT_SECONDS`.
+- Choppy playback: increase `JITTER_BUFFER_MS` slightly (e.g., 160 → 200).
+- Too many interruptions: raise `MIN_INTERRUPTION_WORDS`.
+- Cuts callers off while thinking: increase `TURN_END_GRACE_MS` / `TURN_END_SHORT_UTTERANCE_MS`.
+- Feels too slow: decrease `TURN_END_GRACE_MS` / `TURN_END_SHORT_UTTERANCE_MS`.
+- Frequent CSM timeouts: raise `CSM_TIMEOUT_MS` (fallback still applies).
+- Context feels “too sticky”: reduce `CSM_MAX_CONTEXT_SECONDS`.
 
 ## Troubleshooting
 
-- **CSM returns 413**: context audio payload too large → lower `CSM_MAX_CONTEXT_SECONDS`.
+- **CSM returns 413**: context payload too large → lower `CSM_MAX_CONTEXT_SECONDS`.
 - **CSM returns 503**: model still loading → wait for `/health` to show `status=ok`.
-- **No audio on Twilio**: confirm your main app is sending μ-law 8kHz and 20ms frames; check Railway logs for pacer underflows.
-
+- **No audio on Twilio**: confirm outbound is μ-law 8kHz and 20ms frames; check logs for pacer underflows.
