@@ -46,24 +46,50 @@ def check_env_vars() -> bool:
     
     from dotenv import load_dotenv
     load_dotenv()
-    
-    required_vars = [
-        "PUBLIC_HOST",
-        "TWILIO_ACCOUNT_SID",
-        "TWILIO_AUTH_TOKEN",
-        "DEEPGRAM_API_KEY",
-        "CARTESIA_API_KEY",
-        "GROQ_API_KEY",
-        "GROQ_MODEL",
-    ]
+
+    def effective_voice_mode() -> str:
+        voice_mode = (os.getenv("VOICE_MODE", "auto") or "").strip().lower()
+        openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        if voice_mode in ("", "auto"):
+            return "openai_realtime" if openai_key else "pipeline"
+        if voice_mode in ("realtime", "speech_to_speech", "s2s"):
+            return "openai_realtime"
+        return voice_mode
+
+    mode = effective_voice_mode()
+    tts_provider = (os.getenv("TTS_PROVIDER", "cartesia") or "").strip().lower()
+    llm_provider = (os.getenv("LLM_PROVIDER", "groq") or "").strip().lower()
+
+    required_vars = ["PUBLIC_HOST"]
+
+    if mode == "openai_realtime":
+        required_vars += ["OPENAI_API_KEY", "OPENAI_REALTIME_MODEL"]
+    else:
+        # STT
+        required_vars += ["DEEPGRAM_API_KEY"]
+
+        # TTS
+        if tts_provider in ("cartesia", "csm"):
+            required_vars += ["CARTESIA_API_KEY"]
+        elif tts_provider == "openai":
+            required_vars += ["OPENAI_API_KEY"]
+
+        # LLM
+        if llm_provider == "groq":
+            required_vars += ["GROQ_API_KEY", "GROQ_MODEL"]
+        elif llm_provider == "openai":
+            required_vars += ["OPENAI_API_KEY", "OPENAI_MODEL"]
     
     optional_vars = [
         "PORT",
         "LOG_LEVEL",
+        "VOICE_MODE",
         "DEFAULT_LANGUAGE",
         "DEEPGRAM_LANGUAGE_EN",
         "DEEPGRAM_LANGUAGE_FR",
         "ROUTER_ENABLED",
+        "TTS_PROVIDER",
+        "LLM_PROVIDER",
         "CARTESIA_VOICE_ID",
         "CARTESIA_VOICE_ID_FR",
     ]
@@ -103,6 +129,18 @@ async def check_groq_model() -> bool:
     from dotenv import load_dotenv
     load_dotenv()
     
+    voice_mode = (os.getenv("VOICE_MODE", "auto") or "").strip().lower()
+    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if voice_mode in ("", "auto"):
+        voice_mode = "openai_realtime" if openai_key else "pipeline"
+    if voice_mode in ("realtime", "speech_to_speech", "s2s"):
+        voice_mode = "openai_realtime"
+
+    llm_provider = (os.getenv("LLM_PROVIDER", "groq") or "").strip().lower()
+    if voice_mode != "pipeline" or llm_provider != "groq":
+        print_warn("Skipping Groq validation (not using Groq in this mode)")
+        return True
+
     api_key = os.getenv("GROQ_API_KEY")
     model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     

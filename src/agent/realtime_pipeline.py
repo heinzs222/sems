@@ -69,8 +69,9 @@ def _default_realtime_instructions(config: Config) -> str:
     return (
         f"You are {config.agent_name}, a friendly voice assistant on a phone call for {config.company_name}. "
         "Sound calm and human. Keep responses short and phone-friendly. "
+        "Avoid repetitive filler (e.g., 'Got it', 'No worries'); vary or answer directly. "
         "Match the caller's language (English or French) and stick with it unless the caller switches. "
-        "If the caller pauses, wait quietly—do not repeatedly ask if they are still there. "
+        "If the caller pauses, wait quietly; do not repeatedly ask if they are still there. "
         "If interrupted, stop speaking immediately and listen. "
         "Never claim to be a human."
     )
@@ -300,21 +301,27 @@ class OpenAIRealtimePipeline:
             self.config
         )
 
+        session: dict[str, Any] = {
+            "modalities": ["audio", "text"],
+            "instructions": instructions,
+            "voice": self.config.openai_realtime_voice,
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "turn_detection": {
+                "type": "server_vad",
+                "silence_duration_ms": int(self.config.openai_realtime_turn_silence_ms),
+                "prefix_padding_ms": 100,
+            },
+        }
+
+        transcription_model = (getattr(self.config, "openai_realtime_transcription_model", "") or "").strip()
+        if transcription_model:
+            session["input_audio_transcription"] = {"model": transcription_model}
+
         await self._openai_send(
             {
                 "type": "session.update",
-                "session": {
-                    "modalities": ["audio", "text"],
-                    "instructions": instructions,
-                    "voice": self.config.openai_realtime_voice,
-                    "input_audio_format": "g711_ulaw",
-                    "output_audio_format": "g711_ulaw",
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "silence_duration_ms": int(self.config.openai_realtime_turn_silence_ms),
-                        "prefix_padding_ms": 100,
-                    },
-                },
+                "session": session,
             }
         )
 
@@ -323,6 +330,7 @@ class OpenAIRealtimePipeline:
             model=model,
             voice=self.config.openai_realtime_voice,
             turn_silence_ms=self.config.openai_realtime_turn_silence_ms,
+            transcription_model=transcription_model or None,
         )
 
     async def _openai_send(self, message: dict) -> None:

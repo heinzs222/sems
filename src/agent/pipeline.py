@@ -495,13 +495,14 @@ class VoicePipeline:
 
         return ToneMode.MENU_HELP
 
-    @staticmethod
-    def _apply_tone(text: str, *, language: LanguageCode, tone_mode: ToneMode) -> str:
+    def _apply_tone(self, text: str, *, language: LanguageCode, tone_mode: ToneMode) -> str:
         t = (text or "").strip()
         if not t:
             return t
 
         if tone_mode in (ToneMode.GREETING, ToneMode.CHECK_IN):
+            return t
+        if not getattr(self.config, "tone_prefix_enabled", False):
             return t
 
         prefix_by_mode: dict[ToneMode, dict[LanguageCode, str]] = {

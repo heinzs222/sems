@@ -30,8 +30,9 @@ Relevant env vars are in `.env.example`.
 
 If you want the closest “ChatGPT Voice” style interaction, use the OpenAI Realtime mode:
 
-- Set `VOICE_MODE=openai_realtime`
+- Set `VOICE_MODE=openai_realtime` (or `VOICE_MODE=auto` with `OPENAI_API_KEY` set)
 - Set `OPENAI_API_KEY`
+- Optional: `OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1` to get Whisper transcripts in logs
 
 In this mode, audio goes directly:
 

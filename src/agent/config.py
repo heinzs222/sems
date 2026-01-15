@@ -36,7 +36,8 @@ class Config:
     # Voice mode
     # - pipeline: Deepgram STT + LLM + TTS (current architecture)
     # - openai_realtime: OpenAI Realtime speech-to-speech (audio in/out)
-    voice_mode: str = "pipeline"  # "pipeline" | "openai_realtime"
+    # - auto: choose openai_realtime when OPENAI_API_KEY is set, else pipeline
+    voice_mode: str = "auto"  # "auto" | "pipeline" | "openai_realtime"
     
     # Language
     # - default_language controls the agent's spoken language mode at call start ("en" or "fr")
@@ -75,6 +76,7 @@ class Config:
     openai_realtime_voice: str = "alloy"
     openai_realtime_turn_silence_ms: int = 350
     openai_realtime_instructions: str = ""
+    openai_realtime_transcription_model: str = "whisper-1"
 
     # CSM Microservice (contextual TTS)
     csm_endpoint: str = ""
@@ -95,9 +97,10 @@ class Config:
     
     # Feature flags
     router_enabled: bool = True
-    menu_only: bool = True
+    menu_only: bool = False
     memory_enabled: bool = False
     outlines_enabled: bool = False
+    tone_prefix_enabled: bool = False
     
     # Agent settings
     agent_name: str = "Sesame"
@@ -119,9 +122,9 @@ class Config:
     # - first: seconds after the agent finishes speaking with no user speech
     # - next: seconds between subsequent check-ins (if still silent)
     # - max_prompts: maximum check-ins before going quiet again until user speaks
-    silence_checkin_first_s: float = 12.0
-    silence_checkin_next_s: float = 25.0
-    silence_checkin_max_prompts: int = 2
+    silence_checkin_first_s: float = 20.0
+    silence_checkin_next_s: float = 45.0
+    silence_checkin_max_prompts: int = 1
     min_interruption_words: int = 3
 
     # Audio pacing / jitter buffer (Twilio PSTN is jittery; this smooths outbound playback)
@@ -150,16 +153,24 @@ class Config:
         if not self.public_host:
             missing.append("PUBLIC_HOST")
 
-        voice_mode = (self.voice_mode or "pipeline").strip().lower()
+        voice_mode_raw = (self.voice_mode or "").strip().lower()
+        if voice_mode_raw in ("", "auto"):
+            voice_mode = "openai_realtime" if bool(self.openai_api_key) else "pipeline"
+        else:
+            voice_mode = voice_mode_raw
+
         if voice_mode not in ("pipeline", "openai_realtime", "realtime", "speech_to_speech", "s2s"):
             raise ConfigError(
                 f"Invalid VOICE_MODE '{self.voice_mode}'. Expected 'pipeline' or 'openai_realtime'."
             )
 
+        if voice_mode in ("realtime", "speech_to_speech", "s2s"):
+            voice_mode = "openai_realtime"
+
         # NOTE: Twilio credentials are optional for Media Streams (they're only needed for
         # REST actions like hangup). We do not fail validation if they're missing.
 
-        if voice_mode in ("openai_realtime", "realtime", "speech_to_speech", "s2s"):
+        if voice_mode == "openai_realtime":
             if not self.openai_api_key:
                 missing.append("OPENAI_API_KEY")
             if not self.openai_realtime_model:
@@ -231,6 +242,7 @@ class Config:
             router_enabled=self.router_enabled,
             menu_only=self.menu_only,
             outlines_enabled=self.outlines_enabled,
+            tone_prefix_enabled=self.tone_prefix_enabled,
             agent_name=self.agent_name,
             min_interruption_words=self.min_interruption_words,
             turn_end_grace_ms=self.turn_end_grace_ms,
@@ -252,6 +264,7 @@ class Config:
             openai_realtime_model=self.openai_realtime_model,
             openai_realtime_voice=self.openai_realtime_voice,
             openai_realtime_turn_silence_ms=self.openai_realtime_turn_silence_ms,
+            openai_realtime_transcription_model=self.openai_realtime_transcription_model,
             twilio_sid_prefix=self.twilio_account_sid[:6] + "..." if self.twilio_account_sid else "NOT SET",
             deepgram_key_set=bool(self.deepgram_api_key),
             cartesia_key_set=bool(self.cartesia_api_key),
@@ -292,12 +305,21 @@ def get_config() -> Config:
     default_language_raw = os.getenv("DEFAULT_LANGUAGE", "en").strip().lower()
     default_language = "fr" if default_language_raw.startswith("fr") else "en"
     
+    openai_api_key = os.getenv("OPENAI_API_KEY", "")
+    voice_mode_raw = os.getenv("VOICE_MODE", "auto").strip().lower()
+    if voice_mode_raw in ("", "auto"):
+        voice_mode = "openai_realtime" if openai_api_key.strip() else "pipeline"
+    elif voice_mode_raw in ("realtime", "speech_to_speech", "s2s"):
+        voice_mode = "openai_realtime"
+    else:
+        voice_mode = voice_mode_raw
+
     config = Config(
         # Server
         public_host=os.getenv("PUBLIC_HOST", ""),
         port=_get_int("PORT", 7860),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        voice_mode=os.getenv("VOICE_MODE", "pipeline").strip().lower(),
+        voice_mode=voice_mode,
         
         # Language
         default_language=default_language,
@@ -331,6 +353,10 @@ def get_config() -> Config:
         openai_realtime_voice=os.getenv("OPENAI_REALTIME_VOICE", os.getenv("OPENAI_TTS_VOICE", "alloy")),
         openai_realtime_turn_silence_ms=_get_int("OPENAI_REALTIME_TURN_SILENCE_MS", 350),
         openai_realtime_instructions=os.getenv("OPENAI_REALTIME_INSTRUCTIONS", "").strip(),
+        openai_realtime_transcription_model=os.getenv(
+            "OPENAI_REALTIME_TRANSCRIPTION_MODEL",
+            "whisper-1",
+        ).strip(),
 
         # CSM Microservice (contextual TTS)
         csm_endpoint=os.getenv("CSM_ENDPOINT", "").strip(),
@@ -344,14 +370,15 @@ def get_config() -> Config:
 
         # LLM Provider
         llm_provider=os.getenv("LLM_PROVIDER", "groq").strip().lower(),
-        openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+        openai_api_key=openai_api_key,
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         
         # Feature flags
         router_enabled=_get_bool("ROUTER_ENABLED", True),
-        menu_only=_get_bool("MENU_ONLY", True),
+        menu_only=_get_bool("MENU_ONLY", False),
         memory_enabled=_get_bool("MEMORY_ENABLED", False),
         outlines_enabled=_get_bool("OUTLINES_ENABLED", False),
+        tone_prefix_enabled=_get_bool("TONE_PREFIX_ENABLED", False),
         
         # Agent settings
         agent_name=os.getenv("AGENT_NAME", "Sesame"),
@@ -362,9 +389,9 @@ def get_config() -> Config:
         turn_end_fallback_ms=_get_int("TURN_END_FALLBACK_MS", 950),
         turn_end_short_utterance_ms=_get_int("TURN_END_SHORT_UTTERANCE_MS", 1200),
         turn_end_incomplete_ms=_get_int("TURN_END_INCOMPLETE_MS", 1500),
-        silence_checkin_first_s=_get_float("SILENCE_CHECKIN_FIRST_S", 12.0),
-        silence_checkin_next_s=_get_float("SILENCE_CHECKIN_NEXT_S", 25.0),
-        silence_checkin_max_prompts=_get_int("SILENCE_CHECKIN_MAX_PROMPTS", 2),
+        silence_checkin_first_s=_get_float("SILENCE_CHECKIN_FIRST_S", 20.0),
+        silence_checkin_next_s=_get_float("SILENCE_CHECKIN_NEXT_S", 45.0),
+        silence_checkin_max_prompts=_get_int("SILENCE_CHECKIN_MAX_PROMPTS", 1),
         min_interruption_words=_get_int("MIN_INTERRUPTION_WORDS", 3),
 
         # Audio pacing / jitter buffer
