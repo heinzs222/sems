@@ -113,6 +113,7 @@ class OpenAIRealtimePipeline:
         self._outbound_queue: asyncio.Queue[Optional[OutboundMessage]] = asyncio.Queue()
         self._pacer_task: Optional[asyncio.Task] = None
         self._pacer_running: bool = False
+        self._pacer_rebuffer_event: asyncio.Event = asyncio.Event()
 
         # OpenAI Realtime WS
         self._openai_ws: Optional[Any] = None
@@ -127,6 +128,10 @@ class OpenAIRealtimePipeline:
         # Response tracking / ignore late audio after barge-in.
         self._active_response_id: Optional[str] = None
         self._ignore_audio: bool = False
+
+        # Debounced barge-in to avoid false "speech_started" triggers (echo/noise).
+        self._user_speaking: bool = False
+        self._pending_barge_in_task: Optional[asyncio.Task] = None
 
         # Optional tool calling + per-call memory.
         self._tool_executor: Optional[RenewablesToolExecutor] = None
@@ -155,6 +160,8 @@ class OpenAIRealtimePipeline:
         for task in (self._openai_recv_task, self._openai_send_task, self._pacer_task):
             if task and not task.done():
                 task.cancel()
+        if self._pending_barge_in_task and not self._pending_barge_in_task.done():
+            self._pending_barge_in_task.cancel()
 
         # Unblock queues
         try:
@@ -184,6 +191,7 @@ class OpenAIRealtimePipeline:
         self._pacer_task = None
         self._pacer_running = False
         self._outbound_ulaw_remainder = b""
+        self._pending_barge_in_task = None
 
         logger.info("OpenAI Realtime pipeline stopped")
 
@@ -289,6 +297,14 @@ class OpenAIRealtimePipeline:
         next_send_time = time.time()
         try:
             while self._pacer_running and self._is_running:
+                # Re-buffer at the start of each assistant response to avoid "split phrases"
+                # when audio deltas arrive in bursts.
+                if self._pacer_rebuffer_event.is_set():
+                    self._pacer_rebuffer_event.clear()
+                    if pace_ahead_frames > 0:
+                        buffering = True
+                        buffering_started_at = None
+
                 if buffering:
                     timeout_s: Optional[float] = None
                     if buffering_started_at is not None and pace_ahead_ms > 0:
@@ -512,6 +528,8 @@ class OpenAIRealtimePipeline:
                     self._active_response_id = event.get("response", {}).get("id") or event.get("response_id")
                     self._ignore_audio = False
                     self._state = RealtimeState.SPEAKING
+                    # Trigger small prebuffer for this response to keep speech continuous.
+                    self._pacer_rebuffer_event.set()
                     continue
 
                 if event_type in ("response.done", "response.completed", "response.cancelled"):
@@ -635,7 +653,53 @@ class OpenAIRealtimePipeline:
         if not self.stream_sid:
             return
 
+        self._user_speaking = True
+
         if self._state != RealtimeState.SPEAKING:
+            return
+
+        # Debounce barge-in to avoid false positives from echo/noise that can cause
+        # "assistant starts talking then goes quiet".
+        debounce_ms = int(getattr(self.config, "openai_realtime_barge_in_debounce_ms", 120) or 0)
+        debounce_ms = max(0, debounce_ms)
+        if debounce_ms == 0:
+            await self._interrupt_for_barge_in()
+            return
+
+        if self._pending_barge_in_task and not self._pending_barge_in_task.done():
+            return
+
+        async def _debounced() -> None:
+            try:
+                await asyncio.sleep(debounce_ms / 1000.0)
+                if not self._is_running:
+                    return
+                if self._state != RealtimeState.SPEAKING:
+                    return
+                if not self._user_speaking:
+                    return
+                await self._interrupt_for_barge_in()
+            except asyncio.CancelledError:
+                return
+
+        self._pending_barge_in_task = asyncio.create_task(_debounced())
+
+    async def _handle_user_speech_stopped(self) -> None:
+        self._user_speaking = False
+        if self._pending_barge_in_task and not self._pending_barge_in_task.done():
+            self._pending_barge_in_task.cancel()
+
+        # Only commit and request a response when we're listening (i.e., after caller speech).
+        # If this "speech_stopped" was a brief false trigger while the assistant is speaking,
+        # committing would create weird extra responses.
+        if self._state != RealtimeState.LISTENING:
+            return
+
+        await self._openai_send({"type": "input_audio_buffer.commit"})
+        await self._openai_send({"type": "response.create", "response": {"modalities": ["audio", "text"]}})
+
+    async def _interrupt_for_barge_in(self) -> None:
+        if not self.stream_sid or self._state != RealtimeState.SPEAKING:
             return
 
         self._ignore_audio = True
@@ -655,10 +719,3 @@ class OpenAIRealtimePipeline:
         await self._openai_send({"type": "output_audio_buffer.clear"})
 
         self._state = RealtimeState.LISTENING
-
-    async def _handle_user_speech_stopped(self) -> None:
-        # Commit the audio buffer and request a response.
-        await self._openai_send({"type": "input_audio_buffer.commit"})
-        await self._openai_send(
-            {"type": "response.create", "response": {"modalities": ["audio", "text"]}}
-        )

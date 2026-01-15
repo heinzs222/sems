@@ -1,22 +1,24 @@
-# Voice Presence (Contextual TTS)
+# Voice Presence (Contextual TTS + Speech-to-Speech)
 
 This project is a Twilio PSTN voice agent that answers inbound calls and speaks back over Twilio Media Streams (8kHz G.711 μ-law, 20ms frames).
 
-"Voice presence" here means practical, phone-friendly conversation: natural pacing, consistent prosody across turns, and crisp interruptions (barge-in), without breaking the ordering/checkout flow.
+"Voice presence" here means phone-friendly conversation: natural pacing, consistent tone across turns, and crisp interruption (barge-in), without breaking audio pacing.
 
 ## Architecture
 
-High-level loop:
+Two supported paths:
 
-1. **Twilio → `/ws`**: inbound μ-law 8kHz audio frames (20ms).
-2. **STT (Deepgram)**: streaming transcription + VAD events.
-3. **LLM (Groq/OpenAI)**: generates assistant reply text.
-4. **TTS (pluggable)**: turns reply text into audio.
-5. **Audio bridge**: convert to μ-law 8kHz, chunk to 20ms frames.
-6. **Outbound pacer**: steady 20ms cadence + `mark` events.
-7. **Barge-in**: when the caller speaks, send Twilio `clear`, cancel generation, and listen.
+### A) Pipeline mode (classic)
 
-## TTS Provider Selection
+`Twilio (μ-law/8k) -> STT (Deepgram) -> LLM (Groq/OpenAI) -> TTS (Cartesia/OpenAI/CSM) -> Twilio (μ-law/8k)`
+
+### B) Speech-to-speech mode (OpenAI Realtime)
+
+`Twilio (g711_ulaw/8k) -> OpenAI Realtime -> Twilio (g711_ulaw/8k)`
+
+This mode bypasses Deepgram/Groq/Cartesia entirely and is the closest to a modern "voice mode" experience.
+
+## TTS Provider Selection (Pipeline Mode)
 
 Set `TTS_PROVIDER`:
 
@@ -28,47 +30,40 @@ Relevant env vars are in `.env.example`.
 
 ## Speech-to-Speech (OpenAI Realtime)
 
-If you want the closest “ChatGPT Voice” style interaction, use the OpenAI Realtime mode:
+Enable:
 
-- Set `VOICE_MODE=openai_realtime` (or `VOICE_MODE=auto` with `OPENAI_API_KEY` set)
-- Set `OPENAI_API_KEY`
-- Optional: `OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1` to get Whisper transcripts in logs
-- Optional: `OPENAI_REALTIME_INSTRUCTIONS_FILE=prompts/renewables_system_prompt.txt` (or set `OPENAI_REALTIME_INSTRUCTIONS`)
-- Optional: `OPENAI_REALTIME_TOOLS=renewables` to enable function tools (lead capture / scheduling)
-- Optional (stability): tune `OPENAI_REALTIME_VAD_THRESHOLD`, `OPENAI_REALTIME_NOISE_REDUCTION`, and `OPENAI_REALTIME_PACE_AHEAD_MS` if you hear split phrases or mid-answer cut-offs
+- `VOICE_MODE=openai_realtime` (or `VOICE_MODE=auto` with `OPENAI_API_KEY` set)
+- `OPENAI_API_KEY`
+- `OPENAI_REALTIME_MODEL` and `OPENAI_REALTIME_VOICE`
 
-In this mode, audio goes directly:
+Optional:
 
-`Twilio (g711_ulaw/8k) → OpenAI Realtime → Twilio (g711_ulaw/8k)`
+- `OPENAI_REALTIME_INSTRUCTIONS_FILE=prompts/renewables_system_prompt.txt` (or `OPENAI_REALTIME_INSTRUCTIONS`)
+- `OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1` to log transcripts
+- `OPENAI_REALTIME_TOOLS=renewables` to enable lead-capture/scheduling tools
 
-No Deepgram, Groq, or TTS provider is required.
+Stability / continuity tuning (if you hear split phrases, mid-answer silence, or false barge-in):
+
+- `OPENAI_REALTIME_TURN_SILENCE_MS`: longer waits more for thinking pauses
+- `OPENAI_REALTIME_VAD_THRESHOLD`: higher reduces false speech detection
+- `OPENAI_REALTIME_PREFIX_PADDING_MS`: more context before speech start
+- `OPENAI_REALTIME_BARGE_IN_DEBOUNCE_MS`: filters echo/noise barge-in
+- `OPENAI_REALTIME_NOISE_REDUCTION`: `near_field` / `far_field` / empty
+- `OPENAI_REALTIME_PACE_AHEAD_MS`: small prebuffer for smoother output
 
 ## Contextual TTS (CSM-style)
 
-When `TTS_PROVIDER=csm`, the app maintains a rolling per-call buffer of recent turns:
+When `TTS_PROVIDER=csm`, the app keeps a rolling per-call buffer of recent turns:
 
-- **User turn**: transcript text + a short caller audio snippet (optional).
-- **Assistant turn**: reply text + a short synthesized audio snippet (optional).
+- User turn: transcript text + short caller audio snippet (optional)
+- Assistant turn: reply text + short synthesized audio snippet (optional)
 
 The buffer is aggressively capped:
 
-- Total window: `CSM_MAX_CONTEXT_SECONDS` (default ~24s).
-- Per-snippet cap: derived from the window (typically 3–6 seconds).
+- Total window: `CSM_MAX_CONTEXT_SECONDS` (default ~24s)
+- Per-snippet cap: derived from the window (typically 3–6 seconds)
 
 This context is sent to the microservice on each TTS request to encourage continuity in timing and prosody across turns.
-
-## Turn-Taking (Thinking Pauses)
-
-To avoid the agent "jumping in" while the caller is still thinking, the pipeline adds a short hold before acting on end-of-turn transcripts.
-
-Tune:
-
-- `TURN_END_GRACE_MS`: base hold after end-of-utterance.
-- `TURN_END_SHORT_UTTERANCE_MS`: extra hold for short fragments (common mid-thought).
-- `TURN_END_INCOMPLETE_MS`: extra hold when the last token looks unfinished (e.g., “and…”, “mais…”).
-- `TURN_END_FALLBACK_MS`: hold used when Deepgram emits `is_final` without `speech_final`.
-
-If the agent feels too slow, reduce these values. If it cuts callers off, increase them.
 
 ## GPU Microservice (`csm_service/`)
 
@@ -78,9 +73,9 @@ The microservice exposes:
   - JSON body: `speaker_id`, `prompt_text`, `context[]`, plus optional generation params
   - Returns: `audio/wav` (24kHz mono PCM16) when `Accept: audio/wav` is set
 
-The main app then converts:
+The main app converts:
 
-`24kHz WAV → 8kHz PCM → μ-law 8kHz → 20ms frames`
+`24kHz WAV -> 8kHz PCM -> μ-law 8kHz -> 20ms frames`
 
 ### Run locally (GPU recommended)
 
@@ -103,40 +98,41 @@ From repo root:
 
 ### Deploy (RunPod/Modal/VM)
 
-Use `csm_service/Dockerfile` on a GPU runtime and expose port `8001`.
-
-Then set on Railway (main app):
+Use `csm_service/Dockerfile` on a GPU runtime and expose port `8001`. Then set on Railway (main app):
 
 - `TTS_PROVIDER=csm`
 - `CSM_ENDPOINT=https://<your-csm-host>`
 - Keep `CARTESIA_API_KEY` configured for fallback
 
-## Latency + Fallback Strategy
+## Turn-Taking (Pipeline Mode Thinking Pauses)
 
-The app treats CSM as best-effort:
+To avoid the agent "jumping in" while the caller is still thinking, the pipeline adds a short hold before acting on end-of-turn transcripts.
 
-- If the microservice is slow to return, the main app can play a short backchannel via Cartesia.
-- If CSM errors or times out (`CSM_TIMEOUT_MS`), the turn falls back to Cartesia.
+Tune:
+
+- `TURN_END_GRACE_MS`: base hold after end-of-utterance
+- `TURN_END_SHORT_UTTERANCE_MS`: extra hold for short fragments (often mid-thought)
+- `TURN_END_INCOMPLETE_MS`: extra hold when the last token looks unfinished ("and...", "mais...")
+- `TURN_END_FALLBACK_MS`: hold used when Deepgram emits `is_final` without `speech_final`
 
 ## Barge-in (Interruption)
 
 When the caller speaks while the agent is talking:
 
-1. Send Twilio `clear` (flush buffered audio).
-2. Cancel in-flight TTS generation (including remote CSM requests).
-3. Stop queueing outbound audio frames immediately.
+1. Send Twilio `clear` (flush buffered audio)
+2. Cancel in-flight generation (Realtime response or TTS request)
+3. Stop queueing outbound audio frames immediately
 
 ## Tuning Tips
 
-- Choppy playback: increase `JITTER_BUFFER_MS` slightly (e.g., 160 → 200).
-- Too many interruptions: raise `MIN_INTERRUPTION_WORDS`.
-- Cuts callers off while thinking: increase `TURN_END_GRACE_MS` / `TURN_END_SHORT_UTTERANCE_MS`.
-- Feels too slow: decrease `TURN_END_GRACE_MS` / `TURN_END_SHORT_UTTERANCE_MS`.
-- Frequent CSM timeouts: raise `CSM_TIMEOUT_MS` (fallback still applies).
-- Context feels “too sticky”: reduce `CSM_MAX_CONTEXT_SECONDS`.
+- Choppy playback (pipeline): increase `JITTER_BUFFER_MS` slightly (e.g., 160 -> 200)
+- Too many interruptions (pipeline): raise `MIN_INTERRUPTION_WORDS`
+- Cuts callers off while thinking (pipeline): increase `TURN_END_GRACE_MS` / `TURN_END_SHORT_UTTERANCE_MS`
+- Frequent CSM timeouts: raise `CSM_TIMEOUT_MS` (fallback still applies)
+- Context feels too "sticky": reduce `CSM_MAX_CONTEXT_SECONDS`
 
 ## Troubleshooting
 
-- **CSM returns 413**: context payload too large → lower `CSM_MAX_CONTEXT_SECONDS`.
-- **CSM returns 503**: model still loading → wait for `/health` to show `status=ok`.
-- **No audio on Twilio**: confirm outbound is μ-law 8kHz and 20ms frames; check logs for pacer underflows.
+- **CSM returns 413**: context payload too large -> lower `CSM_MAX_CONTEXT_SECONDS`
+- **CSM returns 503**: model still loading -> wait for `/health` to show `status=ok`
+- **No audio on Twilio**: confirm outbound is μ-law 8kHz and 20ms frames; check logs for pacer underflows or repeated barge-in events

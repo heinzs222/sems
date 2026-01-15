@@ -74,13 +74,16 @@ class Config:
     # OpenAI Realtime (speech-to-speech)
     openai_realtime_model: str = "gpt-4o-realtime-preview"
     openai_realtime_voice: str = "alloy"
-    openai_realtime_turn_silence_ms: int = 350
+    # End-of-turn silence threshold (bigger = fewer premature interruptions while the caller thinks).
+    openai_realtime_turn_silence_ms: int = 650
     openai_realtime_instructions: str = ""
     openai_realtime_instructions_file: str = ""
     openai_realtime_transcription_model: str = "whisper-1"
     openai_realtime_tools: str = "none"  # "none" | "renewables"
     openai_realtime_vad_threshold: float = 0.65
     openai_realtime_prefix_padding_ms: int = 300
+    # Debounce barge-in to reduce false "speech_started" triggers (echo/noise) that can cut off the assistant.
+    openai_realtime_barge_in_debounce_ms: int = 120
     openai_realtime_create_response: bool = False
     openai_realtime_interrupt_response: bool = False
     openai_realtime_noise_reduction: str = "near_field"  # "", "near_field", "far_field"
@@ -278,6 +281,7 @@ class Config:
             openai_realtime_tools=self.openai_realtime_tools,
             openai_realtime_vad_threshold=self.openai_realtime_vad_threshold,
             openai_realtime_prefix_padding_ms=self.openai_realtime_prefix_padding_ms,
+            openai_realtime_barge_in_debounce_ms=self.openai_realtime_barge_in_debounce_ms,
             openai_realtime_create_response=self.openai_realtime_create_response,
             openai_realtime_interrupt_response=self.openai_realtime_interrupt_response,
             openai_realtime_noise_reduction=self.openai_realtime_noise_reduction,
@@ -369,7 +373,7 @@ def get_config() -> Config:
         # OpenAI Realtime (speech-to-speech)
         openai_realtime_model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview"),
         openai_realtime_voice=os.getenv("OPENAI_REALTIME_VOICE", os.getenv("OPENAI_TTS_VOICE", "alloy")),
-        openai_realtime_turn_silence_ms=_get_int("OPENAI_REALTIME_TURN_SILENCE_MS", 350),
+        openai_realtime_turn_silence_ms=_get_int("OPENAI_REALTIME_TURN_SILENCE_MS", 650),
         openai_realtime_instructions=os.getenv("OPENAI_REALTIME_INSTRUCTIONS", "").strip(),
         openai_realtime_instructions_file=os.getenv("OPENAI_REALTIME_INSTRUCTIONS_FILE", "").strip(),
         openai_realtime_transcription_model=os.getenv(
@@ -379,6 +383,7 @@ def get_config() -> Config:
         openai_realtime_tools=os.getenv("OPENAI_REALTIME_TOOLS", "none").strip().lower(),
         openai_realtime_vad_threshold=_get_float("OPENAI_REALTIME_VAD_THRESHOLD", 0.65),
         openai_realtime_prefix_padding_ms=_get_int("OPENAI_REALTIME_PREFIX_PADDING_MS", 300),
+        openai_realtime_barge_in_debounce_ms=_get_int("OPENAI_REALTIME_BARGE_IN_DEBOUNCE_MS", 120),
         openai_realtime_create_response=_get_bool("OPENAI_REALTIME_CREATE_RESPONSE", False),
         openai_realtime_interrupt_response=_get_bool("OPENAI_REALTIME_INTERRUPT_RESPONSE", False),
         openai_realtime_noise_reduction=os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field").strip().lower(),
