@@ -26,6 +26,19 @@ Set `TTS_PROVIDER`:
 
 Relevant env vars are in `.env.example`.
 
+## Speech-to-Speech (OpenAI Realtime)
+
+If you want the closest “ChatGPT Voice” style interaction, use the OpenAI Realtime mode:
+
+- Set `VOICE_MODE=openai_realtime`
+- Set `OPENAI_API_KEY`
+
+In this mode, audio goes directly:
+
+`Twilio (g711_ulaw/8k) → OpenAI Realtime → Twilio (g711_ulaw/8k)`
+
+No Deepgram, Groq, or TTS provider is required.
+
 ## Contextual TTS (CSM-style)
 
 When `TTS_PROVIDER=csm`, the app maintains a rolling per-call buffer of recent turns:

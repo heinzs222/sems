@@ -100,15 +100,19 @@ async def lifespan(app: FastAPI):
         # Initialize and validate configuration
         config = init_config()
         configure_logging(config.log_level)
-        
-        # Validate Groq model at startup
-        from src.agent.llm import initialize_llm
-        await initialize_llm()
-        
-        # Initialize semantic router (lazy, but warm up)
-        if config.router_enabled and not config.menu_only:
-            from src.agent.routing import initialize_router
-            initialize_router()
+
+        voice_mode = (getattr(config, "voice_mode", "pipeline") or "pipeline").strip().lower()
+        if voice_mode in ("openai_realtime", "realtime", "speech_to_speech", "s2s"):
+            logger.info("OpenAI Realtime mode enabled; skipping pipeline warmups")
+        else:
+            # Validate LLM model at startup (pipeline mode only)
+            from src.agent.llm import initialize_llm
+            await initialize_llm()
+
+            # Initialize semantic router (lazy, but warm up)
+            if config.router_enabled and not config.menu_only:
+                from src.agent.routing import initialize_router
+                initialize_router()
         
         logger.info(
             "Server ready",

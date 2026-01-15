@@ -32,6 +32,11 @@ class Config:
     public_host: str
     port: int = 7860
     log_level: str = "INFO"
+
+    # Voice mode
+    # - pipeline: Deepgram STT + LLM + TTS (current architecture)
+    # - openai_realtime: OpenAI Realtime speech-to-speech (audio in/out)
+    voice_mode: str = "pipeline"  # "pipeline" | "openai_realtime"
     
     # Language
     # - default_language controls the agent's spoken language mode at call start ("en" or "fr")
@@ -64,6 +69,12 @@ class Config:
     # OpenAI (TTS)
     openai_tts_model: str = "gpt-4o-mini-tts"
     openai_tts_voice: str = "alloy"
+
+    # OpenAI Realtime (speech-to-speech)
+    openai_realtime_model: str = "gpt-4o-realtime-preview"
+    openai_realtime_voice: str = "alloy"
+    openai_realtime_turn_silence_ms: int = 350
+    openai_realtime_instructions: str = ""
 
     # CSM Microservice (contextual TTS)
     csm_endpoint: str = ""
@@ -138,12 +149,33 @@ class Config:
         
         if not self.public_host:
             missing.append("PUBLIC_HOST")
-        if not self.twilio_account_sid:
-            missing.append("TWILIO_ACCOUNT_SID")
-        if not self.twilio_auth_token:
-            missing.append("TWILIO_AUTH_TOKEN")
+
+        voice_mode = (self.voice_mode or "pipeline").strip().lower()
+        if voice_mode not in ("pipeline", "openai_realtime", "realtime", "speech_to_speech", "s2s"):
+            raise ConfigError(
+                f"Invalid VOICE_MODE '{self.voice_mode}'. Expected 'pipeline' or 'openai_realtime'."
+            )
+
+        # NOTE: Twilio credentials are optional for Media Streams (they're only needed for
+        # REST actions like hangup). We do not fail validation if they're missing.
+
+        if voice_mode in ("openai_realtime", "realtime", "speech_to_speech", "s2s"):
+            if not self.openai_api_key:
+                missing.append("OPENAI_API_KEY")
+            if not self.openai_realtime_model:
+                missing.append("OPENAI_REALTIME_MODEL")
+
+            if missing:
+                raise ConfigError(
+                    f"Missing required environment variables: {', '.join(missing)}\n"
+                    "Please check your .env file."
+                )
+            return
+
+        # Default: classic STT -> LLM -> TTS pipeline.
         if not self.deepgram_api_key:
             missing.append("DEEPGRAM_API_KEY")
+
         tts = (self.tts_provider or "cartesia").strip().lower()
         if tts not in ("cartesia", "openai", "csm"):
             raise ConfigError(
@@ -186,6 +218,7 @@ class Config:
             public_host=self.public_host,
             port=self.port,
             log_level=self.log_level,
+            voice_mode=self.voice_mode,
             default_language=self.default_language,
             deepgram_language_en=self.deepgram_language_en,
             deepgram_language_fr=self.deepgram_language_fr,
@@ -216,6 +249,9 @@ class Config:
             csm_timeout_ms=self.csm_timeout_ms,
             csm_max_context_seconds=self.csm_max_context_seconds,
             csm_voice_style=self.csm_voice_style,
+            openai_realtime_model=self.openai_realtime_model,
+            openai_realtime_voice=self.openai_realtime_voice,
+            openai_realtime_turn_silence_ms=self.openai_realtime_turn_silence_ms,
             twilio_sid_prefix=self.twilio_account_sid[:6] + "..." if self.twilio_account_sid else "NOT SET",
             deepgram_key_set=bool(self.deepgram_api_key),
             cartesia_key_set=bool(self.cartesia_api_key),
@@ -261,6 +297,7 @@ def get_config() -> Config:
         public_host=os.getenv("PUBLIC_HOST", ""),
         port=_get_int("PORT", 7860),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        voice_mode=os.getenv("VOICE_MODE", "pipeline").strip().lower(),
         
         # Language
         default_language=default_language,
@@ -288,6 +325,12 @@ def get_config() -> Config:
         # OpenAI (TTS)
         openai_tts_model=os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
         openai_tts_voice=os.getenv("OPENAI_TTS_VOICE", "alloy"),
+
+        # OpenAI Realtime (speech-to-speech)
+        openai_realtime_model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview"),
+        openai_realtime_voice=os.getenv("OPENAI_REALTIME_VOICE", os.getenv("OPENAI_TTS_VOICE", "alloy")),
+        openai_realtime_turn_silence_ms=_get_int("OPENAI_REALTIME_TURN_SILENCE_MS", 350),
+        openai_realtime_instructions=os.getenv("OPENAI_REALTIME_INSTRUCTIONS", "").strip(),
 
         # CSM Microservice (contextual TTS)
         csm_endpoint=os.getenv("CSM_ENDPOINT", "").strip(),

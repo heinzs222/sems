@@ -3548,7 +3548,7 @@ class VoicePipeline:
 
 async def create_pipeline(
     send_message: Callable[[str], Awaitable[None]],
-) -> VoicePipeline:
+) -> Any:
     """
     Create and start a new voice pipeline.
     
@@ -3558,6 +3558,16 @@ async def create_pipeline(
     Returns:
         Initialized and started VoicePipeline
     """
-    pipeline = VoicePipeline(send_message)
+    config = get_config()
+    mode = (getattr(config, "voice_mode", "pipeline") or "pipeline").strip().lower()
+
+    if mode in ("openai_realtime", "realtime", "speech_to_speech", "s2s"):
+        from src.agent.realtime_pipeline import OpenAIRealtimePipeline
+
+        pipeline = OpenAIRealtimePipeline(send_message, config=config)
+        await pipeline.start()
+        return pipeline
+
+    pipeline = VoicePipeline(send_message, config=config)
     await pipeline.start()
     return pipeline
