@@ -209,7 +209,7 @@ class OpenAIRealtimePipeline:
             {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio"],
+                    "modalities": ["audio", "text"],
                     "instructions": "Greet the caller briefly and ask how you can help.",
                 },
             }
@@ -476,4 +476,6 @@ class OpenAIRealtimePipeline:
     async def _handle_user_speech_stopped(self) -> None:
         # Commit the audio buffer and request a response.
         await self._openai_send({"type": "input_audio_buffer.commit"})
-        await self._openai_send({"type": "response.create", "response": {"modalities": ["audio"]}})
+        await self._openai_send(
+            {"type": "response.create", "response": {"modalities": ["audio", "text"]}}
+        )
