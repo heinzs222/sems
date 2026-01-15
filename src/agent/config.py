@@ -79,6 +79,12 @@ class Config:
     openai_realtime_instructions_file: str = ""
     openai_realtime_transcription_model: str = "whisper-1"
     openai_realtime_tools: str = "none"  # "none" | "renewables"
+    openai_realtime_vad_threshold: float = 0.65
+    openai_realtime_prefix_padding_ms: int = 300
+    openai_realtime_create_response: bool = False
+    openai_realtime_interrupt_response: bool = False
+    openai_realtime_noise_reduction: str = "near_field"  # "", "near_field", "far_field"
+    openai_realtime_pace_ahead_ms: int = 120
 
     # CSM Microservice (contextual TTS)
     csm_endpoint: str = ""
@@ -270,6 +276,12 @@ class Config:
             openai_realtime_voice=self.openai_realtime_voice,
             openai_realtime_turn_silence_ms=self.openai_realtime_turn_silence_ms,
             openai_realtime_tools=self.openai_realtime_tools,
+            openai_realtime_vad_threshold=self.openai_realtime_vad_threshold,
+            openai_realtime_prefix_padding_ms=self.openai_realtime_prefix_padding_ms,
+            openai_realtime_create_response=self.openai_realtime_create_response,
+            openai_realtime_interrupt_response=self.openai_realtime_interrupt_response,
+            openai_realtime_noise_reduction=self.openai_realtime_noise_reduction,
+            openai_realtime_pace_ahead_ms=self.openai_realtime_pace_ahead_ms,
             openai_realtime_transcription_model=self.openai_realtime_transcription_model,
             twilio_sid_prefix=self.twilio_account_sid[:6] + "..." if self.twilio_account_sid else "NOT SET",
             deepgram_key_set=bool(self.deepgram_api_key),
@@ -365,6 +377,12 @@ def get_config() -> Config:
             "whisper-1",
         ).strip(),
         openai_realtime_tools=os.getenv("OPENAI_REALTIME_TOOLS", "none").strip().lower(),
+        openai_realtime_vad_threshold=_get_float("OPENAI_REALTIME_VAD_THRESHOLD", 0.65),
+        openai_realtime_prefix_padding_ms=_get_int("OPENAI_REALTIME_PREFIX_PADDING_MS", 300),
+        openai_realtime_create_response=_get_bool("OPENAI_REALTIME_CREATE_RESPONSE", False),
+        openai_realtime_interrupt_response=_get_bool("OPENAI_REALTIME_INTERRUPT_RESPONSE", False),
+        openai_realtime_noise_reduction=os.getenv("OPENAI_REALTIME_NOISE_REDUCTION", "near_field").strip().lower(),
+        openai_realtime_pace_ahead_ms=_get_int("OPENAI_REALTIME_PACE_AHEAD_MS", 120),
 
         # CSM Microservice (contextual TTS)
         csm_endpoint=os.getenv("CSM_ENDPOINT", "").strip(),

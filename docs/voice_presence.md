@@ -35,6 +35,7 @@ If you want the closest “ChatGPT Voice” style interaction, use the OpenAI Re
 - Optional: `OPENAI_REALTIME_TRANSCRIPTION_MODEL=whisper-1` to get Whisper transcripts in logs
 - Optional: `OPENAI_REALTIME_INSTRUCTIONS_FILE=prompts/renewables_system_prompt.txt` (or set `OPENAI_REALTIME_INSTRUCTIONS`)
 - Optional: `OPENAI_REALTIME_TOOLS=renewables` to enable function tools (lead capture / scheduling)
+- Optional (stability): tune `OPENAI_REALTIME_VAD_THRESHOLD`, `OPENAI_REALTIME_NOISE_REDUCTION`, and `OPENAI_REALTIME_PACE_AHEAD_MS` if you hear split phrases or mid-answer cut-offs
 
 In this mode, audio goes directly:
 

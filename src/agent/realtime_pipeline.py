@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
@@ -223,11 +224,19 @@ class OpenAIRealtimePipeline:
         await self._connect_openai()
 
         # Optional initial greeting to avoid "dead air" at call start.
+        greeting_instructions = "Greet the caller briefly and ask how you can help."
+        if self._tool_executor:
+            greeting_instructions = (
+                "Start the call with a warm hello. "
+                "In one short turn, explain you can help with renewable energy options (solar, batteries, heat pumps, green electricity). "
+                "Ask what name you should use."
+            )
         await self._openai_send(
             {
                 "type": "response.create",
                 "response": {
                     "modalities": ["audio", "text"],
+                    "instructions": greeting_instructions,
                 },
             }
         )
@@ -271,12 +280,54 @@ class OpenAIRealtimePipeline:
 
     async def _audio_pacer(self) -> None:
         frame_duration = 0.020
+        pace_ahead_ms = int(getattr(self.config, "openai_realtime_pace_ahead_ms", 0) or 0)
+        pace_ahead_frames = max(0, int(pace_ahead_ms / (frame_duration * 1000)))
+        buffer: deque[OutboundMessage] = deque()
+        buffering = pace_ahead_frames > 0
+        buffering_started_at: Optional[float] = None
+
         next_send_time = time.time()
         try:
             while self._pacer_running and self._is_running:
-                outbound = await self._outbound_queue.get()
-                if outbound is None:
-                    break
+                if buffering:
+                    timeout_s: Optional[float] = None
+                    if buffering_started_at is not None and pace_ahead_ms > 0:
+                        remaining = (pace_ahead_ms / 1000.0) - (time.time() - buffering_started_at)
+                        timeout_s = max(0.0, remaining)
+
+                    try:
+                        outbound = (
+                            await asyncio.wait_for(self._outbound_queue.get(), timeout=timeout_s)
+                            if timeout_s is not None
+                            else await self._outbound_queue.get()
+                        )
+                    except asyncio.TimeoutError:
+                        # Start playback with what we have buffered so far.
+                        buffering = False
+                        next_send_time = time.time()
+                        continue
+                    if outbound is None:
+                        break
+                    if not outbound.pace:
+                        await self._send_message(outbound.message)
+                        continue
+
+                    if buffering_started_at is None:
+                        buffering_started_at = time.time()
+                    buffer.append(outbound)
+
+                    # Start once we have enough audio buffered, or once we've waited long enough.
+                    if len(buffer) >= pace_ahead_frames:
+                        buffering = False
+                        next_send_time = time.time()
+                    continue
+
+                if buffer:
+                    outbound = buffer.popleft()
+                else:
+                    outbound = await self._outbound_queue.get()
+                    if outbound is None:
+                        break
 
                 if not outbound.pace:
                     await self._send_message(outbound.message)
@@ -323,6 +374,21 @@ class OpenAIRealtimePipeline:
         )
         if file_instructions:
             instructions = file_instructions
+        elif self._tool_executor and (getattr(self.config, "openai_realtime_tools", "none") or "").strip().lower() == "renewables":
+            # If tools are enabled but no prompt was provided, default to the renewables prompt.
+            default_renewables = resolve_prompt(
+                config=self.config,
+                inline_text="",
+                file_path="prompts/renewables_system_prompt.txt",
+            )
+            if default_renewables:
+                instructions = default_renewables
+
+        vad_threshold = float(getattr(self.config, "openai_realtime_vad_threshold", 0.65) or 0.65)
+        vad_threshold = min(1.0, max(0.0, vad_threshold))
+        prefix_padding_ms = int(getattr(self.config, "openai_realtime_prefix_padding_ms", 300) or 300)
+        create_response = bool(getattr(self.config, "openai_realtime_create_response", False))
+        interrupt_response = bool(getattr(self.config, "openai_realtime_interrupt_response", False))
 
         session: dict[str, Any] = {
             "modalities": ["audio", "text"],
@@ -333,9 +399,18 @@ class OpenAIRealtimePipeline:
             "turn_detection": {
                 "type": "server_vad",
                 "silence_duration_ms": int(self.config.openai_realtime_turn_silence_ms),
-                "prefix_padding_ms": 100,
+                "prefix_padding_ms": prefix_padding_ms,
+                "threshold": vad_threshold,
+                "create_response": create_response,
+                "interrupt_response": interrupt_response,
             },
         }
+
+        noise_reduction = (getattr(self.config, "openai_realtime_noise_reduction", "") or "").strip().lower()
+        if noise_reduction in ("near_field", "far_field"):
+            session["input_audio_noise_reduction"] = {"type": noise_reduction}
+
+        pace_ahead_ms = int(getattr(self.config, "openai_realtime_pace_ahead_ms", 0) or 0)
 
         transcription_model = (getattr(self.config, "openai_realtime_transcription_model", "") or "").strip()
         if transcription_model:
@@ -358,6 +433,12 @@ class OpenAIRealtimePipeline:
             voice=self.config.openai_realtime_voice,
             turn_silence_ms=self.config.openai_realtime_turn_silence_ms,
             transcription_model=transcription_model or None,
+            vad_threshold=vad_threshold,
+            prefix_padding_ms=prefix_padding_ms,
+            create_response=create_response,
+            interrupt_response=interrupt_response,
+            noise_reduction=noise_reduction or None,
+            pace_ahead_ms=pace_ahead_ms if pace_ahead_ms > 0 else None,
         )
 
     async def _openai_send(self, message: dict) -> None:
@@ -554,6 +635,9 @@ class OpenAIRealtimePipeline:
         if not self.stream_sid:
             return
 
+        if self._state != RealtimeState.SPEAKING:
+            return
+
         self._ignore_audio = True
         self._outbound_ulaw_remainder = b""
 
@@ -568,6 +652,7 @@ class OpenAIRealtimePipeline:
 
         # Cancel OpenAI response (best effort).
         await self._openai_send({"type": "response.cancel"})
+        await self._openai_send({"type": "output_audio_buffer.clear"})
 
         self._state = RealtimeState.LISTENING
 
